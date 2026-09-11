@@ -100,6 +100,9 @@ pub struct InputEditorStyle {
     pub editor_invisible: Option<Hsla>,
     pub editor_active_line: Option<Hsla>,
     pub editor_gutter_background: Option<Hsla>,
+    /// The colour of a set breakpoint dot in the gutter. Unset falls back to
+    /// the error diagnostic colour.
+    pub editor_breakpoint: Option<Hsla>,
     pub fold_icon_renderer: Option<FoldIconRenderer>,
 }
 
@@ -155,6 +158,7 @@ impl Default for InputEditorStyle {
             editor_invisible: None,
             editor_active_line: None,
             editor_gutter_background: None,
+            editor_breakpoint: None,
             fold_icon_renderer: None,
         }
     }

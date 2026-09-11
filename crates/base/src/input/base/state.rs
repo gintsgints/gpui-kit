@@ -14,6 +14,7 @@ use ropey::{Rope, RopeSlice};
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::ops::Range;
 use std::rc::Rc;
 use sum_tree::Bias;
@@ -121,9 +122,14 @@ actions!(
 #[derive(Clone)]
 pub enum InputEvent {
     Change,
-    PressEnter { secondary: bool, shift: bool },
+    PressEnter {
+        secondary: bool,
+        shift: bool,
+    },
     Focus,
     Blur,
+    /// A gutter breakpoint was toggled, carrying its 0-based buffer line.
+    BreakpointToggled(usize),
 }
 
 pub(super) const CONTEXT: &str = "Input";
@@ -453,6 +459,14 @@ pub struct InputBaseState<M: InputModeKind> {
     _subscriptions: Vec<Subscription>,
 
     pub(super) auto_scroll: AutoScroll,
+
+    /// Added to every gutter line number before it is drawn, so an editor showing a
+    /// slice of a larger document can number its rows as they are numbered there.
+    pub(super) line_number_offset: i32,
+    /// Whether the clickable breakpoint gutter is drawn, left of the line numbers.
+    pub(super) breakpoints_enabled: bool,
+    /// The lines carrying a breakpoint, as 0-based buffer rows.
+    pub(super) breakpoints: HashSet<usize>,
 }
 
 /// Read-only styling data exposed to presentation facades.
@@ -736,6 +750,9 @@ impl<M: InputModeKind> InputBaseState<M> {
             _pending_update: false,
             cursor_line_end_affinity: false,
             auto_scroll: AutoScroll::default(),
+            line_number_offset: 0,
+            breakpoints_enabled: false,
+            breakpoints: HashSet::new(),
         }
     }
 
@@ -1274,6 +1291,60 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx.notify();
     }
 
+    /// Add `offset` to every gutter line number before it is drawn.
+    ///
+    /// An editor showing a slice of a larger document numbers its first row `1` by
+    /// default; the offset makes it read as the row it is in that document instead.
+    /// Only line numbers move — every offset in the API stays 0-based on this text.
+    pub fn line_number_offset(mut self, offset: i32) -> Self {
+        self.line_number_offset = offset;
+        self
+    }
+
+    /// Set the gutter line number offset at runtime. See [`Self::line_number_offset`].
+    pub fn set_line_number_offset(&mut self, offset: i32, cx: &mut Context<Self>) {
+        if self.line_number_offset != offset {
+            self.line_number_offset = offset;
+            cx.notify();
+        }
+    }
+
+    /// Draw a clickable breakpoint gutter left of the line numbers.
+    ///
+    /// A set breakpoint always shows; the rest appear while the gutter is hovered, so
+    /// every line can be clicked. Clicking one calls [`Self::toggle_breakpoint`], which
+    /// emits [`InputEvent::BreakpointToggled`] for the application to act on.
+    pub fn breakpoints_enabled(mut self, enabled: bool) -> Self {
+        self.breakpoints_enabled = enabled;
+        self
+    }
+
+    /// Whether the clickable breakpoint gutter is drawn.
+    pub fn has_breakpoint_gutter(&self) -> bool {
+        self.breakpoints_enabled
+    }
+
+    /// The lines carrying a breakpoint, as 0-based buffer rows.
+    pub fn breakpoints(&self) -> &HashSet<usize> {
+        &self.breakpoints
+    }
+
+    /// Replace the breakpoint lines. Does not emit [`InputEvent::BreakpointToggled`].
+    pub fn set_breakpoints(&mut self, lines: HashSet<usize>, cx: &mut Context<Self>) {
+        self.breakpoints = lines;
+        cx.notify();
+    }
+
+    /// Toggle the breakpoint on a 0-based buffer line, emitting
+    /// [`InputEvent::BreakpointToggled`].
+    pub fn toggle_breakpoint(&mut self, line: usize, cx: &mut Context<Self>) {
+        if !self.breakpoints.remove(&line) {
+            self.breakpoints.insert(line);
+        }
+        cx.emit(InputEvent::BreakpointToggled(line));
+        cx.notify();
+    }
+
     pub(super) fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
         self.undo_manager.break_transaction_coalescing();
         self.select_all_cursors_to(|s, sel| s.previous_boundary(sel.cursor_offset()), cx);
@@ -1288,15 +1359,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         }
         self.undo_manager.break_transaction_coalescing();
-        self.select_all_cursors_to(
-            |s, sel| {
-                let offset = s
-                    .start_of_line_at(sel.cursor_offset(), s.line_end_affinity_for(sel))
-                    .saturating_sub(1);
-                s.previous_boundary(offset)
-            },
-            cx,
-        );
+        self.select_all_cursors_to(|s, sel| s.vertical_select_target(sel, -1), cx);
     }
 
     pub(super) fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
@@ -1304,16 +1367,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         }
         self.undo_manager.break_transaction_coalescing();
-        let len = self.text.len();
-        self.select_all_cursors_to(
-            |s, sel| {
-                let offset = (s.end_of_line_at(sel.cursor_offset(), s.line_end_affinity_for(sel))
-                    + 1)
-                .min(len);
-                s.next_boundary(offset)
-            },
-            cx,
-        );
+        self.select_all_cursors_to(|s, sel| s.vertical_select_target(sel, 1), cx);
     }
 
     pub(super) fn on_action_select_all(
@@ -8619,6 +8673,97 @@ mod tests {
         });
         input.read_with(&cx, |state, _| {
             assert_eq!(state.text.to_string(), "line1\nline2\nline3");
+        });
+    }
+
+    /// Regression test: shift+up/shift+down must extend the selection with the same
+    /// column-preserving vertical movement a plain arrow key uses. The `end_of_line + 1`
+    /// path it replaced always swallowed the newline and overshot by a whole line when
+    /// the neighbouring line was empty.
+    #[gpui::test]
+    fn test_select_up_down_preserves_column(cx: &mut TestAppContext) {
+        let view = multi_line(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+
+        // Offsets: line 0 "hello" = 0..5, line 1 "" = 6..6, line 2 "hello" = 7..12
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("hello\n\nhello", window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        // Placing the cursor only records the preferred column once the text has been
+        // laid out, which is what vertical movement reads back.
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_cursor_position(Position::new(0, 3), window, cx);
+                assert_eq!(state.cursor(), 3);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                // Down onto the empty line stops at its start; the old path jumped
+                // straight into line 2.
+                state.select_down(&SelectDown, window, cx);
+                assert_eq!(state.selected_range(), 3..6);
+
+                // Column 3 is restored on line 2, not clamped to the line start above.
+                state.select_down(&SelectDown, window, cx);
+                assert_eq!(state.selected_range(), 3..10);
+
+                // Up retraces the same offsets back, and clamps on the first line.
+                state.select_up(&SelectUp, window, cx);
+                assert_eq!(state.selected_range(), 3..6);
+                state.select_up(&SelectUp, window, cx);
+                assert_eq!(state.selected_range(), 3..3);
+                state.select_up(&SelectUp, window, cx);
+                assert_eq!(state.selected_range(), 3..3);
+            });
+        });
+    }
+
+    /// The same regression anchored at column 0, where the old path selected the whole
+    /// first line plus its newline instead of stopping at the start of the next line.
+    #[gpui::test]
+    fn test_select_up_down_from_column_zero(cx: &mut TestAppContext) {
+        let view = multi_line(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("hello\n\nhello", window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_cursor_position(Position::new(0, 0), window, cx);
+                assert_eq!(state.cursor(), 0);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.select_down(&SelectDown, window, cx);
+                assert_eq!(state.selected_range(), 0..6);
+
+                state.select_down(&SelectDown, window, cx);
+                assert_eq!(state.selected_range(), 0..7);
+
+                state.select_up(&SelectUp, window, cx);
+                assert_eq!(state.selected_range(), 0..6);
+                state.select_up(&SelectUp, window, cx);
+                assert_eq!(state.selected_range(), 0..0);
+                state.select_up(&SelectUp, window, cx);
+                assert_eq!(state.selected_range(), 0..0);
+            });
         });
     }
 

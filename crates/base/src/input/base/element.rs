@@ -51,6 +51,9 @@ pub(super) const RIGHT_MARGIN: Pixels = px(10.);
 pub(super) const LINE_NUMBER_RIGHT_MARGIN: Pixels = px(10.);
 const FOLD_ICON_WIDTH: Pixels = px(14.);
 const FOLD_ICON_HITBOX_WIDTH: Pixels = px(18.);
+/// Width of the breakpoint strip at the left of the gutter, when it is enabled.
+const BREAKPOINT_GUTTER_WIDTH: Pixels = px(14.);
+const BREAKPOINT_DOT_WIDTH: Pixels = px(8.);
 const MAX_HIGHLIGHT_LINE_LENGTH: usize = 10_000;
 const FOLD_CHEVRON_RIGHT_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>"#;
 const FOLD_CHEVRON_DOWN_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>"#;
@@ -280,6 +283,17 @@ fn clamp_auto_grow_vertical_scroll_offset(
     }
 }
 
+/// Width the breakpoint strip claims at the left of the gutter: zero unless the state
+/// asked for it and there is a gutter to put it in. Without line numbers the strip has
+/// nothing to sit beside and would draw its dots over the text.
+fn breakpoint_gutter_width<M: InputModeKind>(state: &InputBaseState<M>) -> Pixels {
+    if state.breakpoints_enabled && state.mode.line_number() {
+        BREAKPOINT_GUTTER_WIDTH
+    } else {
+        px(0.)
+    }
+}
+
 fn editor_gutter_bounds(
     input_bounds: Bounds<Pixels>,
     line_number_width: Pixels,
@@ -395,6 +409,17 @@ struct FoldIconLayout {
     line_number_hitbox: Hitbox,
     /// List of (display_row, is_folded, icon_element) pairs for each fold candidate
     icons: Vec<(usize, bool, gpui::AnyElement)>,
+}
+
+/// Layout information for the clickable breakpoint gutter.
+#[derive(Default)]
+struct BreakpointLayout {
+    /// Width the strip claims at the left of the gutter, zero when it is disabled.
+    width: Pixels,
+    /// Hitbox over the strip, used to reveal the unset dots on hover.
+    hitbox: Option<Hitbox>,
+    /// One `(is_set, dot_element)` per visible buffer line.
+    dots: Vec<(bool, gpui::AnyElement)>,
 }
 
 pub(super) struct TextElement<M: InputModeKind> {
@@ -680,6 +705,14 @@ impl<M: InputModeKind> TextElement<M> {
             .zip(lines.iter())
         {
             let prev_lines_offset = *prev_lines_offset;
+
+            // The range ends exactly where this line starts, so it covers nothing on it.
+            // Skipping it avoids the minimum-width stub below painting a sliver over a
+            // caret sitting at column 0.
+            if end_ix == prev_lines_offset && start_ix < prev_lines_offset {
+                break;
+            }
+
             let line_size = line.size(line_height);
             let line_wrap_width = line_size.width;
 
@@ -1019,6 +1052,10 @@ impl<M: InputModeKind> TextElement<M> {
             line_number_width += FOLD_ICON_HITBOX_WIDTH
         }
 
+        // Reserve the breakpoint strip at the left, so the numbers move right rather
+        // than the dots sitting on top of them.
+        line_number_width += breakpoint_gutter_width(state);
+
         (line_number_width, line_number_len)
     }
 
@@ -1336,6 +1373,105 @@ impl<M: InputModeKind> TextElement<M> {
         }
     }
 
+    /// Prepaint one clickable dot per visible line at the left of the gutter, coloured
+    /// for the lines that carry a breakpoint. Mirrors [`Self::layout_fold_icons`].
+    fn layout_breakpoints(
+        &self,
+        origin_x: Pixels,
+        bounds: &Bounds<Pixels>,
+        last_layout: &LastLayout,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> BreakpointLayout {
+        let (width, breakpoints, set_color, unset_color) = {
+            let state = self.state.read(cx);
+            let width = breakpoint_gutter_width(state);
+            if width == px(0.) {
+                return BreakpointLayout::default();
+            }
+
+            let style = &state.editor_style;
+            (
+                width,
+                state.breakpoints.clone(),
+                style.editor_breakpoint.unwrap_or(style.diagnostics.error),
+                style.muted_foreground.opacity(0.4),
+            )
+        };
+
+        let mut layout = BreakpointLayout {
+            width,
+            hitbox: Some(window.insert_hitbox(
+                Bounds::new(
+                    point(origin_x, bounds.origin.y + last_layout.visible_top),
+                    size(width, bounds.size.height),
+                ),
+                HitboxBehavior::Normal,
+            )),
+            dots: Vec::with_capacity(last_layout.visible_buffer_lines.len()),
+        };
+
+        let line_height = last_layout.line_height;
+        let mut offset_y = last_layout.visible_top;
+        for (line, &buffer_line) in last_layout
+            .lines
+            .iter()
+            .zip(last_layout.visible_buffer_lines.iter())
+        {
+            let is_set = breakpoints.contains(&buffer_line);
+            let dot_origin = point(
+                origin_x + (width - BREAKPOINT_DOT_WIDTH).half(),
+                bounds.origin.y + offset_y + (line_height - BREAKPOINT_DOT_WIDTH).half(),
+            );
+
+            let mut dot = gpui::div()
+                .id(("breakpoint", buffer_line))
+                .size(BREAKPOINT_DOT_WIDTH)
+                .rounded_full()
+                .bg(if is_set { set_color } else { unset_color })
+                .on_mouse_down(MouseButton::Left, {
+                    let state = self.state.clone();
+                    move |_, _: &mut Window, cx: &mut App| {
+                        cx.stop_propagation();
+                        state.update(cx, |state, cx| state.toggle_breakpoint(buffer_line, cx));
+                    }
+                })
+                .into_any_element();
+            dot.prepaint_as_root(
+                dot_origin,
+                size(BREAKPOINT_DOT_WIDTH, BREAKPOINT_DOT_WIDTH).into(),
+                window,
+                cx,
+            );
+
+            layout.dots.push((is_set, dot));
+            offset_y += line.wrapped_lines.len() * line_height;
+        }
+
+        layout
+    }
+
+    /// Paint the breakpoint dots: a set line always, an unset one only while the strip
+    /// is hovered, so any line can be clicked to add one without the gutter reading as
+    /// a column of dots the rest of the time.
+    fn paint_breakpoints(
+        &mut self,
+        layout: &mut BreakpointLayout,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let is_hovered = layout
+            .hitbox
+            .as_ref()
+            .is_some_and(|hitbox| hitbox.is_hovered(window));
+
+        for (is_set, dot) in layout.dots.iter_mut() {
+            if *is_set || is_hovered {
+                dot.paint(window, cx);
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn layout_lines(
         state: &InputBaseState<M>,
@@ -1639,6 +1775,8 @@ pub(super) struct PrepaintState {
     bounds: Bounds<Pixels>,
     /// Fold icon layout data
     fold_icon_layout: FoldIconLayout,
+    /// Breakpoint gutter layout data
+    breakpoint_layout: BreakpointLayout,
     // Inline completion rendering data
     /// Shaped ghost lines to paint after cursor row (completion lines 2+)
     ghost_lines: Vec<ShapedLine>,
@@ -2095,8 +2233,9 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 .iter()
                 .zip(last_layout.visible_buffer_lines.iter())
             {
+                let displayed_line = buffer_line as i64 + 1 + state.line_number_offset as i64;
                 let line_no: SharedString =
-                    format!("{:>width$}", buffer_line + 1, width = line_number_len).into();
+                    format!("{:>width$}", displayed_line, width = line_number_len).into();
 
                 let runs = if current_row == Some(buffer_line) {
                     &current_line_runs
@@ -2134,6 +2273,8 @@ impl<M: InputModeKind> Element for TextElement<M> {
             )));
         let fold_icon_layout =
             self.layout_fold_icons(original_x, &bounds, &last_layout, window, cx);
+        let breakpoint_layout =
+            self.layout_breakpoints(original_x, &bounds, &last_layout, window, cx);
 
         PrepaintState {
             bounds,
@@ -2150,6 +2291,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
             document_color_paths,
             indent_guides_path,
             fold_icon_layout,
+            breakpoint_layout,
             ghost_first_line,
             ghost_lines,
             ghost_lines_height,
@@ -2406,7 +2548,10 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 .iter()
                 .zip(prepaint.last_layout.visible_buffer_lines.iter())
             {
-                let p = point(input_bounds.origin.x, origin.y + offset_y);
+                let p = point(
+                    input_bounds.origin.x + prepaint.breakpoint_layout.width,
+                    origin.y + offset_y,
+                );
                 let is_active = prepaint.current_row == Some(buffer_line);
 
                 let height = line_height * lines.len() as f32;
@@ -2442,6 +2587,8 @@ impl<M: InputModeKind> Element for TextElement<M> {
             window,
             cx,
         );
+
+        self.paint_breakpoints(&mut prepaint.breakpoint_layout, window, cx);
 
         self.state.update(cx, |state, cx| {
             let geometry_changed = state.last_bounds != Some(bounds)

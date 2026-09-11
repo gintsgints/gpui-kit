@@ -172,6 +172,19 @@ impl<M: InputModeKind> InputBaseState<M> {
         (new_offset, new_affinity)
     }
 
+    /// The offset a shift-up/shift-down should extend `sel` to: the same target a plain
+    /// vertical move would land on, so extending a selection keeps the remembered column
+    /// instead of snapping to the start or the end of the neighbouring line.
+    pub(super) fn vertical_select_target(&self, sel: &CursorSelection, move_lines: isize) -> usize {
+        self.vertical_target(
+            sel.cursor_offset(),
+            sel.column_anchor,
+            self.line_end_affinity_for(sel),
+            move_lines,
+        )
+        .0
+    }
+
     /// Move every cursor through `f`, which maps each selection to a
     /// `(new_offset, column_anchor, line_end_affinity)`, collapsing each to a
     /// cursor. Overlapping cursors are merged, then the standard post-move
