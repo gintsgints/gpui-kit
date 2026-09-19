@@ -464,6 +464,50 @@
         "exports": [
           "Input"
         ],
+        "related": [
+          {
+            "descriptor": "InputGroup",
+            "exports": [
+              "InputGroup"
+            ],
+            "role": "companion-control"
+          },
+          {
+            "descriptor": "InputGroupAddon",
+            "exports": [
+              "InputGroupAddon"
+            ],
+            "role": "named-slot-part"
+          },
+          {
+            "descriptor": "InputGroupButton",
+            "exports": [
+              "InputGroupButton"
+            ],
+            "role": "named-slot-part"
+          },
+          {
+            "descriptor": "InputGroupInput",
+            "exports": [
+              "InputGroupInput"
+            ],
+            "role": "named-slot-part"
+          },
+          {
+            "descriptor": "InputGroupTextarea",
+            "exports": [
+              "InputGroupTextarea"
+            ],
+            "role": "named-slot-part"
+          },
+          {
+            "descriptor": "InputGroupText",
+            "exports": [
+              "InputGroupText"
+            ],
+            "role": "named-slot-part"
+          }
+        ],
         "states": [
           {
             "export": "InputState",
@@ -1643,6 +1687,67 @@
         "descriptor": "Image",
         "exports": [
           "Image"
+        ]
+      }
+    },
+    {
+      "source": "story",
+      "name": "input_group",
+      "classification": "component",
+      "registration": {
+        "status": "registered",
+        "descriptor": "InputGroup",
+        "exports": [
+          "InputGroup"
+        ],
+        "related": [
+          {
+            "descriptor": "InputGroupAddon",
+            "exports": [
+              "InputGroupAddon"
+            ],
+            "role": "named-slot-part"
+          },
+          {
+            "descriptor": "InputGroupButton",
+            "exports": [
+              "InputGroupButton"
+            ],
+            "role": "named-slot-part"
+          },
+          {
+            "descriptor": "InputGroupInput",
+            "exports": [
+              "InputGroupInput"
+            ],
+            "role": "named-slot-part"
+          },
+          {
+            "descriptor": "InputGroupTextarea",
+            "exports": [
+              "InputGroupTextarea"
+            ],
+            "role": "named-slot-part"
+          },
+          {
+            "descriptor": "InputGroupText",
+            "exports": [
+              "InputGroupText"
+            ],
+            "role": "named-slot-part"
+          }
+        ],
+        "states": [
+          {
+            "export": "InputState",
+            "kind": "InputState",
+            "role": "retained-single-line-state"
+          },
+          {
+            "export": "TextareaState",
+            "kind": "TextareaState",
+            "role": "retained-multi-line-state"
+          }
         ]
       }
     },

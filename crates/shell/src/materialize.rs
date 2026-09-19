@@ -138,6 +138,7 @@ use gpui_base::{
 mod components;
 
 use crate::{
+    capability::is_openable_url,
     engine::ShellRuntime,
     scroll::Scrollable,
     snapshot::RenderSnapshot,
@@ -333,6 +334,8 @@ struct Behavior {
     href: Option<SharedString>,
     on_click: Option<CallbackId>,
     on_change: Option<CallbackId>,
+    token: Option<CallbackId>,
+    on_token_click: Option<CallbackId>,
     on_mouse_move: Option<CallbackId>,
     on_hover: Option<CallbackId>,
     /// Reports a key press that reached this element.
@@ -1073,6 +1076,20 @@ fn materialize_component(
                 view = view.on_link_click(move |url, _event, window, cx| {
                     route.emit(crate::HostValue::from(url.to_string()), window, cx);
                 });
+            } else {
+                view = view.on_link_click(|url, event, _, cx| {
+                    // Preserve Base's activation behavior, but apply Shell's URL rules.
+                    let activate = match event {
+                        gpui::ClickEvent::Mouse(click) => {
+                            matches!(click.up.button, MouseButton::Left | MouseButton::Middle)
+                        }
+                        gpui::ClickEvent::Keyboard(_) => true,
+                        gpui::ClickEvent::Touch(click) => !click.long_press,
+                    };
+                    if activate && is_openable_url(url) {
+                        cx.open_url(url);
+                    }
+                });
             }
             Styled::style(&mut view).refine(&refinement);
             view.into_any_element()
@@ -1484,7 +1501,23 @@ fn materialize_component(
             frame.extend(children);
             let frame = with_hover(frame, &states);
             let frame = with_active_and_focus(frame, &states);
-            frame.child(Input::new(&state)).into_any_element()
+            let callbacks = crate::InlineTokenCallbacks::new(
+                &state,
+                behavior
+                    .token
+                    .map(|id| crate::ComponentElementCallback::from_runtime(runtime, id)),
+                behavior
+                    .on_token_click
+                    .map(|id| crate::ComponentCallback::from_runtime(runtime, id)),
+            );
+            let input = callbacks.apply(
+                Input::new(&state),
+                |input, render| input.token(move |token, window, cx| render(token, window, cx)),
+                |input, listen| {
+                    input.on_token_click(move |event, window, cx| listen(event, window, cx))
+                },
+            );
+            frame.child(input).into_any_element()
         }
         Component::OtpInput(handle) => components::otp_input::otp_input(
             runtime, handle, refinement, behavior, states, children, window, cx,
@@ -2479,6 +2512,8 @@ pub(in crate::materialize) fn resolve_ops(
                 "on_scroll_wheel" => behavior.on_scroll_wheel = Some(*id),
                 "on_resize" => behavior.on_resize = Some(*id),
                 "on_change" => behavior.on_change = Some(*id),
+                "token" => behavior.token = Some(*id),
+                "on_token_click" => behavior.on_token_click = Some(*id),
                 "on_step" => behavior.on_step = Some(*id),
                 "on_open_change" => behavior.on_open_change = Some(*id),
                 "on_confirm" => behavior.on_confirm = Some(*id),
