@@ -1,17 +1,18 @@
 ---
 title: Chart
-description: 支持折线图、柱状图、面积图、饼图、雷达图、K 线图和桑基图的数据可视化组件。
+description: 支持折线图、柱状图、面积图、饼图、雷达图、K 线图、桑基图和火焰图的数据可视化组件。
 ---
 
 # Chart
 
-Chart 是一组完整的数据可视化组件，提供 Line、Bar、Area、Pie、Radar、Candlestick 和 Sankey 图表。它们支持动画、自定义样式、主题配色和多种展示方式，适合仪表盘、统计分析和行情场景。
+Chart 是一组完整的数据可视化组件，提供 Line、Bar、Area、Pie、Radar、Candlestick、Sankey 和 FlameGraph 图表。它们支持动画、自定义样式、主题配色和多种展示方式，适合仪表盘、统计分析和行情场景。
 
 ## 导入
 
 ```rust
 use gpui_kit::component::chart::{
     LineChart, BarChart, AreaChart, PieChart, RadarChart, CandlestickChart, SankeyChart,
+    FlameGraph, FlamePath,
 };
 ```
 
@@ -576,6 +577,96 @@ SankeyChart::new(nodes, links).value_scale(SankeyValueScale::Sqrt)
 
 无论用哪种缩放，每个节点都被其连接精确填满，所以子节点高度始终与父节点匹配。
 
+### FlameGraph
+
+火焰图展示一棵调用栈树：每个栈帧的宽度就是它的数值，深度就是它在调用栈中的位置。它是为性能剖析数据准备的——采样数、毫秒、分配字节数——这类数据的树很大，其中绝大部分窄到看不见。
+
+组件不会对传入的树做合并、排序或重新缩放。把采样聚合成树、决定同层栈帧的先后顺序，都由调用方决定；栈帧自身的数值决定它的宽度，也决定 tooltip 里的所有百分比。
+
+#### 基础火焰图
+
+```rust
+struct StackFrame {
+    label: SharedString,
+    value: f64,
+    children: Vec<StackFrame>,
+}
+
+// 根是一片森林，从左到右排布：例如每个线程一个根。
+FlameGraph::new(profile)
+    .children(|d: &StackFrame| d.children.as_slice())
+    .value(|d: &StackFrame| d.value)
+    .label(|d: &StackFrame| d.label.clone())
+    .id("flame-graph")
+```
+
+剖析数据通常只加载一次并长期持有，所以 `shared` 直接接管你已有的 `Rc`，不必每次渲染都复制整棵树：
+
+```rust
+let profile: Rc<Vec<StackFrame>> = self.profile.clone();
+
+FlameGraph::shared(profile)
+```
+
+#### 方向与高度
+
+默认是 icicle：根在顶部，调用栈向下生长，与 samply 和浏览器性能面板的画法一致。`flame` 则翻转过来，从底边向上生长。
+
+```rust
+FlameGraph::new(profile).flame().row_height(px(22.))
+```
+
+组件会填满给定区域，超出的部分直接裁掉；它自己不负责滚动。用 `height` 计算外层容器的高度，它按图表当前设置的行高作答：
+
+```rust
+let chart = FlameGraph::shared(profile).row_height(px(18.));
+
+div().h(chart.height(max_depth)).child(chart)
+```
+
+#### 缩放
+
+缩放状态归调用方所有：用 `focus` 传入聚焦的栈帧，在 `on_click` 中更新它。整个状态只是一个 `Option<FlamePath>`——祖先行、缩放后的取值区间、以及退回上层的路径，全都由它推导出来。
+
+```rust
+FlameGraph::shared(profile)
+    .id("flame-graph")
+    .children(|d: &StackFrame| d.children.as_slice())
+    .value(|d: &StackFrame| d.value)
+    .focus(self.focus.clone())
+    .on_click(cx.listener(|this, path: &FlamePath, _, cx| {
+        this.focus = Some(path.clone());
+        cx.notify();
+    }))
+```
+
+聚焦的栈帧占满宽度，它的祖先仍然作为整行留在上方，因此点击祖先即可逐级退回，点击根所在的那一行则回到全景。缩放动画使用主题的 slow 时长。点击需要设置 `id`；按下后移动超过三像素会被当作拖拽，所以在深栈上拖动滚动永远不会误触发缩放。组件不处理滚轮和键盘：滚轮属于承载图表的滚动容器，Esc 则由你自己绑定到自己的聚焦状态上。
+
+#### 颜色与标签
+
+不设置 `color` 时，栈帧会按标签的哈希值从主题的 chart 配色中取一个，既让相邻栈帧互相区分，也让同一个栈帧在多次渲染之间保持同一种颜色。如果你知道模块、crate 或类别信息，就按它们着色——这比哈希值有意义得多。
+
+```rust
+FlameGraph::shared(profile)
+    .color(|d: &StackFrame| match d.module {
+        Module::App => cx.theme().chart_1,
+        Module::Runtime => cx.theme().chart_3,
+        Module::Kernel => cx.theme().muted,
+    })
+    .format(|value| format!("{:.1} ms", value).into())
+```
+
+栈帧足够宽时，标签画在栈帧内部，放不下就以省略号截断；tooltip 里始终是完整标签。`format` 决定数值在 tooltip 中的写法——剖析数据可能是采样数、毫秒或字节，只有你知道是哪一种。tooltip 中的百分比由组件计算。
+
+#### 大规模剖析数据
+
+宽度不足半像素的栈帧不会绘制，它的整棵子树也不会：所有后代都落在父栈帧的区间之内，因此同样不可能可见。于是开销取决于屏幕上的像素数，而不是树的规模；十万个栈帧的剖析数据，实际绘制的只是那几百个看得清的栈帧。
+
+有两个由此而来的行为值得留意：
+
+- 子栈帧总和超出父栈帧时，按父栈帧的末端裁剪，而不是重新缩放，让不一致的数据暴露出来而不是被掩盖。
+- 数值为零、负数或 NaN 的栈帧连同其子树一并剪除。
+
 ## 悬停与 Tooltip
 
 图表在设置 `id` 之前都是静态绘图。设置之后，它会对光标做命中测试，为光标所在的数据显示 tooltip，并按图表类型强调这条数据：
@@ -1078,3 +1169,4 @@ impl LiveChart {
 [PieChart]: https://docs.rs/gpui-component/latest/gpui_component/chart/struct.PieChart.html
 [RadarChart]: https://docs.rs/gpui-component/latest/gpui_component/chart/struct.RadarChart.html
 [CandlestickChart]: https://docs.rs/gpui-component/latest/gpui_component/chart/struct.CandlestickChart.html
+[FlameGraph]: https://docs.rs/gpui-component/latest/gpui_component/chart/struct.FlameGraph.html
