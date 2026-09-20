@@ -5,8 +5,8 @@ use gpui_kit::base::ElementExt as _;
 use gpui_kit::component::{
     ActiveTheme, Icon, StyledExt,
     chart::{
-        AreaChart, BarChart, CandlestickChart, LineChart, PieChart, RadarChart, SankeyChart,
-        SankeyLabel,
+        AreaChart, BarChart, CandlestickChart, FlameGraph, FlamePath, LineChart, PieChart,
+        RadarChart, SankeyChart, SankeyLabel,
     },
     dock::PanelControl,
     h_flex,
@@ -24,6 +24,7 @@ use gpui_kit::{
 use serde::Deserialize;
 
 use super::StackedBarChart;
+use super::profile::{self, StackFrame};
 use crate::Story;
 
 /// The height of one chart card, and the list's overdraw: the virtual list
@@ -187,6 +188,12 @@ struct ChartData {
     product_scores: Vec<ProductScore>,
     stock_prices: Vec<StockPrice>,
     tsla_statements: Vec<(SharedString, Vec<TslaNode>, Vec<SankeyLink>)>,
+    /// A synthetic profile of about a hundred thousand stack frames.
+    profile: Rc<Vec<StackFrame>>,
+    /// The frame the flame graph is zoomed to. A card renders from `&App` and
+    /// cannot reach the story, so the zoom lives in an entity both it and the
+    /// click handler can touch.
+    flame_focus: Entity<Option<FlamePath>>,
 }
 
 /// `1234` as `1.2K`, `1234567` as `1.2M`; smaller numbers keep their digits.
@@ -440,6 +447,7 @@ enum ChartCard {
     CandlestickNarrow,
     CandlestickWide,
     CandlestickTickMargin,
+    Flame,
     /// The income statement at this index of [`ChartData::tsla_statements`].
     Sankey(usize),
 }
@@ -1220,6 +1228,40 @@ impl ChartCard {
                 10,
                 "candlestick-chart-tick-margin",
             ),
+            Self::Flame => {
+                let profile = data.profile.clone();
+                let focus = data.flame_focus.clone();
+                let zoomed = focus.read(cx).is_some();
+
+                Card::new(
+                    "Profile",
+                    format!(
+                        "{} frames, {} deep",
+                        compact(profile::count(&profile) as f64),
+                        profile::depth(&profile)
+                    ),
+                )
+                .chart(
+                    FlameGraph::shared(profile)
+                        .id("flame-graph")
+                        .children(|frame: &StackFrame| frame.children.as_slice())
+                        .value(|frame: &StackFrame| frame.value)
+                        .label(|frame: &StackFrame| frame.label.clone())
+                        .format(|value| compact(value).into())
+                        .focus(focus.read(cx).clone())
+                        .on_click(move |path, _, cx| {
+                            let path = path.clone();
+                            focus.update(cx, |focus, cx| {
+                                *focus = Some(path);
+                                cx.notify();
+                            });
+                        }),
+                )
+                .note(match zoomed {
+                    true => "Click an ancestor row to zoom back out",
+                    false => "Click a frame to zoom into it",
+                })
+            }
             Self::Sankey(index) => {
                 let Some((period, nodes, links)) = data.tsla_statements.get(index) else {
                     return div().into_any_element();
@@ -1457,6 +1499,12 @@ impl ChartStory {
             })
             .collect();
 
+        let profile = Rc::new(profile::sample_profile());
+        // The zoom lives outside the story so a card, which renders from
+        // `&App`, can still change it; the story redraws when it does.
+        let flame_focus = cx.new(|_| None);
+        cx.observe(&flame_focus, |_, _, cx| cx.notify()).detach();
+
         let sections = sections(tsla_statements.len());
         // The story is docked inside a narrower panel than the window, so this
         // is only a first guess; the prepaint below corrects it.
@@ -1482,6 +1530,8 @@ impl ChartStory {
                 product_scores: fixture(include_str!("../../fixtures/product-scores.json")),
                 stock_prices,
                 tsla_statements,
+                profile,
+                flame_focus,
             }),
             sections,
             columns,
@@ -1541,6 +1591,7 @@ fn sections(sankey_count: usize) -> Vec<ChartSection> {
             CandlestickWide,
             CandlestickTickMargin,
         ]),
+        ChartSection::after_rule([Flame]),
         ChartSection::after_rule((0..sankey_count).map(Sankey)),
     ]
 }

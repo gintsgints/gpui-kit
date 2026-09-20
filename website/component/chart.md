@@ -1,17 +1,18 @@
 ---
 title: Chart
-description: Beautiful charts and graphs for data visualization including line, bar, area, pie, radar, candlestick, and sankey charts.
+description: Beautiful charts and graphs for data visualization including line, bar, area, pie, radar, candlestick, sankey and flame charts.
 ---
 
 # Chart
 
-A comprehensive charting library providing Line, Bar, Area, Pie, Radar, Candlestick, and Sankey charts for data visualization. The charts feature smooth animations, customizable styling, tooltips, legends, and automatic theming that adapts to your application's theme.
+A comprehensive charting library providing Line, Bar, Area, Pie, Radar, Candlestick, Sankey and Flame charts for data visualization. The charts feature smooth animations, customizable styling, tooltips, legends, and automatic theming that adapts to your application's theme.
 
 ## Import
 
 ```rust
 use gpui_kit::component::chart::{
     LineChart, BarChart, AreaChart, PieChart, RadarChart, CandlestickChart, SankeyChart,
+    FlameGraph, FlamePath,
 };
 ```
 
@@ -600,6 +601,96 @@ SankeyChart::new(nodes, links).value_scale(SankeyValueScale::Sqrt)
 
 Every node stays exactly filled by its ribbons under either scale, so children always match their parent's height.
 
+### FlameGraph
+
+A flame graph shows a tree of stack frames: each frame is as wide as its value and as deep as its place in the stack. It is built for profiles — samples, milliseconds, allocated bytes — where the tree is large and most of it is too narrow to see.
+
+The chart never folds, sorts or rescales the tree it is given. Aggregating samples into a tree, and ordering children within it, stay your decisions; a frame's own value is authoritative for its width and for every percentage in the tooltip.
+
+#### Basic Flame Graph
+
+```rust
+struct StackFrame {
+    label: SharedString,
+    value: f64,
+    children: Vec<StackFrame>,
+}
+
+// The roots are a forest, packed left to right: one per thread, say.
+FlameGraph::new(profile)
+    .children(|d: &StackFrame| d.children.as_slice())
+    .value(|d: &StackFrame| d.value)
+    .label(|d: &StackFrame| d.label.clone())
+    .id("flame-graph")
+```
+
+A profile is loaded once and kept, so `shared` adopts an `Rc` you already hold instead of copying the tree on every render:
+
+```rust
+let profile: Rc<Vec<StackFrame>> = self.profile.clone();
+
+FlameGraph::shared(profile)
+```
+
+#### Orientation and Height
+
+The default is an icicle: the root on top, the stack growing down, as samply and the browser profilers draw it. `flame` turns it over, growing up from the bottom edge.
+
+```rust
+FlameGraph::new(profile).flame().row_height(px(22.))
+```
+
+The chart fills the area it is given and clips what does not fit; it owns no scrolling of its own. Use `height` to size the container it goes in — it answers at whatever row height the chart is set to:
+
+```rust
+let chart = FlameGraph::shared(profile).row_height(px(18.));
+
+div().h(chart.height(max_depth)).child(chart)
+```
+
+#### Zoom
+
+Zoom state is yours: pass the focused frame to `focus` and update it from `on_click`. The whole state is one `Option<FlamePath>` — the ancestor rows, the zoomed domain and the way back out all derive from it.
+
+```rust
+FlameGraph::shared(profile)
+    .id("flame-graph")
+    .children(|d: &StackFrame| d.children.as_slice())
+    .value(|d: &StackFrame| d.value)
+    .focus(self.focus.clone())
+    .on_click(cx.listener(|this, path: &FlamePath, _, cx| {
+        this.focus = Some(path.clone());
+        cx.notify();
+    }))
+```
+
+The focused frame fills the width and its ancestors stay as full-width rows above it, so clicking an ancestor zooms back out and clicking a root row resets. The zoom animates over the theme's slow duration. Clicks need an `id`, and a press that travels more than three pixels is treated as a drag, so scrolling a deep stack never ends in an accidental zoom. There is no wheel or keyboard handling: the wheel belongs to whatever scrolls the chart, and Escape is yours to bind against your own focus state.
+
+#### Colors and Labels
+
+Without a `color` accessor, a frame takes one of the theme's chart colors, chosen by hashing its label, so neighbours differ and a frame keeps its color across renders. Color by module, crate or category when you have that information — it says more than a hash does.
+
+```rust
+FlameGraph::shared(profile)
+    .color(|d: &StackFrame| match d.module {
+        Module::App => cx.theme().chart_1,
+        Module::Runtime => cx.theme().chart_3,
+        Module::Kernel => cx.theme().muted,
+    })
+    .format(|value| format!("{:.1} ms", value).into())
+```
+
+A label is drawn inside its frame when the frame is wide enough for one, truncated with a trailing ellipsis, and always shown in full in the tooltip. `format` spells a value for the tooltip — a profile counts samples, milliseconds or bytes, and only you know which. The tooltip's percentages are computed by the chart.
+
+#### Large Profiles
+
+A frame narrower than half a pixel is not painted, and neither is its subtree: every descendant sits inside its parent's extent, so none of them could be visible either. Cost therefore tracks the pixels on screen rather than the size of the tree, and a hundred-thousand-frame profile paints the few hundred frames that are actually legible.
+
+Two consequences worth knowing:
+
+- Children that over-run their parent are clipped at the parent's end rather than rescaled, so an inconsistent tree shows it instead of hiding it.
+- A frame whose value is zero, negative or not a number is pruned along with its subtree.
+
 ## Hover and Tooltips
 
 Every chart is a static plot until it is given an `id`. With one, it hit-tests the cursor, shows a tooltip for the datum under it, and emphasizes that datum the way the chart's kind calls for:
@@ -1115,3 +1206,4 @@ impl LiveChart {
 [PieChart]: https://docs.rs/gpui-component/latest/gpui_component/chart/struct.PieChart.html
 [RadarChart]: https://docs.rs/gpui-component/latest/gpui_component/chart/struct.RadarChart.html
 [CandlestickChart]: https://docs.rs/gpui-component/latest/gpui_component/chart/struct.CandlestickChart.html
+[FlameGraph]: https://docs.rs/gpui-component/latest/gpui_component/chart/struct.FlameGraph.html
