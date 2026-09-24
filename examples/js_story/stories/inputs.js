@@ -2,6 +2,16 @@ import { pendingStory } from "./story.js";
 
 export const stories = [
   pendingStory({
+    id: "questionnaire",
+    title: "Questionnaire",
+    group: "Inputs",
+    rustStory: "QuestionnaireStory",
+    description: "Multi-step questions with answers, validation, and navigation.",
+    states: ["single", "multiple", "freeform", "skip", "validation"],
+    availability: "pending",
+    api: "Questionnaire",
+  }),
+  pendingStory({
     id: "input-group",
     title: "Input Group",
     group: "Inputs",
@@ -40,6 +50,16 @@ export const stories = [
     states: ["normal", "min/max", "disabled"],
     availability: "pending",
     api: "NumberInput",
+  }),
+  pendingStory({
+    id: "time-field",
+    title: "TimeField",
+    group: "Inputs",
+    rustStory: "TimeFieldStory",
+    description: "Segmented time-of-day input.",
+    states: ["default", "disabled"],
+    availability: "pending",
+    api: "TimeField",
   }),
   pendingStory({
     id: "otp-input",

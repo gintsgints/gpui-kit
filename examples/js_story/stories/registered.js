@@ -93,6 +93,10 @@ import {
   PieChart,
   Popover,
   Progress,
+  Questionnaire,
+  QuestionnaireChoice,
+  QuestionnaireInput,
+  QuestionnaireItem,
   RadarChart,
   Radio,
   RadioGroup,
@@ -137,10 +141,13 @@ import {
   Text,
   Textarea,
   TextareaState,
+  TimeField,
+  TimeFieldState,
   Stepper,
   StepperItem,
   SuccessAlert,
   Toggle,
+  Toolbar,
   Tooltip,
   Tree,
   WarningAlert,
@@ -236,6 +243,7 @@ const tokenDraft = {
 
 export function initializeRegisteredExamples() {
   retained("token-input", () => { const input = InputState(); input.set_value(tokenDraft); return input; });
+  retained("questionnaire-direction", () => InputState("Type another direction…"));
   retained("token-textarea", () => { const input = TextareaState(); input.set_value(tokenDraft); return input; });
   for (const [id, placeholder, value] of inputGroupFields) {
     retained(`input-group-extra:${id}`, () => InputState(placeholder, value));
@@ -266,6 +274,8 @@ export function initializeRegisteredExamples() {
   retained("slider-disabled", () => SliderState(24));
   retained("color-picker", () => ColorPickerState());
   retained("date-picker", () => DatePickerState());
+  retained("time-field", () => TimeFieldState());
+  retained("time-field-disabled", () => TimeFieldState());
   retained("calendar-one", () => CalendarState());
   retained("calendar-two", () => CalendarState());
   retained("carousel-basic", () => CarouselState(3));
@@ -1317,6 +1327,19 @@ export function registeredExamples(surface, cx) {
           element: asElement(new OtpInput(retained("otp-four", () => OtpState(4)))),
         },
       ];
+    case "TimeField":
+      return [
+        {
+          label: "Hours and minutes",
+          element: asElement(new TimeField(retained("time-field", () => TimeFieldState()))),
+        },
+        {
+          label: "Disabled",
+          element: asElement(
+            new TimeField(retained("time-field-disabled", () => TimeFieldState())).disabled(true),
+          ),
+        },
+      ];
     case "Textarea":
       return [
         {
@@ -1715,6 +1738,39 @@ export function registeredExamples(surface, cx) {
             ),
         },
       ];
+    case "Questionnaire":
+      return [
+        {
+          label: "Guided setup",
+          description:
+            "One question at a time, with letter shortcuts, a freeform answer, and validation on Next.",
+          element: asElement(
+            new Questionnaire("registered-questionnaire")
+              .shortcuts("letters")
+              .child(
+                new QuestionnaireItem("direction", "What should we prototype next?")
+                  .required(true)
+                  .description("Choose a direction or write your own.")
+                  .child(new QuestionnaireChoice("delegation", "Delegation"))
+                  .child(new QuestionnaireChoice("questions", "Question prompts"))
+                  .child(
+                    new QuestionnaireInput(
+                      retained("questionnaire-direction", () =>
+                        InputState("Type another direction…"),
+                      ),
+                      "Another direction",
+                    ),
+                  ),
+              )
+              .child(
+                new QuestionnaireItem("tone", "What tone should the interface use?")
+                  .description("This optional question can be skipped.")
+                  .child(new QuestionnaireChoice("direct", "Direct"))
+                  .child(new QuestionnaireChoice("warm", "Warm")),
+              ),
+          ),
+        },
+      ];
     case "Progress":
       return [
         {
@@ -1812,6 +1868,54 @@ export function registeredExamples(surface, cx) {
               .right_content(asElement(new Button("status-position").ghost().size("xsmall").label("Ln 12, Col 34")))
               .right_content(asElement(new VerticalSeparator().h(14)))
               .right_content(asElement(new Button("status-language").ghost().size("xsmall").label("JavaScript"))),
+          ),
+        },
+      ];
+    case "Toolbar":
+      return [
+        {
+          label: "Document toolbar",
+          description: "Leading file and history commands, a centered document name, and trailing utilities.",
+          element: asElement(
+            div()
+              .w_full()
+              .border(1)
+              .child(
+                asElement(
+                  new Toolbar("document-toolbar")
+                    .w_full()
+                    .child(asElement(new Button("toolbar-new").ghost().compact().size("small").label("New")))
+                    .child(asElement(new Button("toolbar-open").ghost().compact().size("small").label("Open")))
+                    .child(asElement(new VerticalSeparator().h(20)))
+                    .child(asElement(new Button("toolbar-undo").ghost().compact().size("small").label("Undo")))
+                    .child(asElement(new Button("toolbar-redo").ghost().compact().size("small").label("Redo")))
+                    .child(asElement(div().flex_1()))
+                    .child(asElement(new Text("Quarterly report")))
+                    .child(asElement(div().flex_1()))
+                    .child(asElement(new Button("toolbar-find").ghost().compact().size("small").label("Find")))
+                    .child(asElement(new Button("toolbar-more").ghost().compact().size("small").label("More"))),
+                ),
+              ),
+          ),
+        },
+        {
+          label: "Table toolbar",
+          description: "A compact table header with status content and trailing data commands.",
+          element: asElement(
+            div()
+              .w_full()
+              .border(1)
+              .child(
+                asElement(
+                  new Toolbar("table-toolbar")
+                    .w_full()
+                    .child(asElement(new Text("Open orders · 24")))
+                    .child(asElement(div().flex_1()))
+                    .child(asElement(new Button("toolbar-export-orders").ghost().compact().size("small").label("Export…")))
+                    .child(asElement(new Button("toolbar-refresh-orders").ghost().compact().size("small").label("Refresh")))
+                    .child(asElement(new Button("toolbar-columns").ghost().compact().size("small").label("Columns"))),
+                ),
+              ),
           ),
         },
       ];
