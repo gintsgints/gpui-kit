@@ -52,6 +52,7 @@ collapsed: false
 - [DatePicker](date-picker) - Date selection with calendar
 - [TimeField](time-field) - Segmented time-of-day input
 - [OtpInput](otp-input) - One-time password input
+- [Speech](speech) - Dictation through the system recognizer or your own
 - [ColorPicker](color-picker) - Color selection interface
 - [Form](form) - Form container and layout
 
@@ -73,6 +74,7 @@ collapsed: false
 
 ### Advanced Components
 
+- [Diff](./diff.md) - Readonly patch display for code review and change previews
 - [Calendar](calendar) - Calendar display and navigation
 - [Carousel](carousel) - Browse through a set of related items
 - [Command](command) - Command palette for search and quick actions

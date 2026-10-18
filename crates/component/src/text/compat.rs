@@ -153,6 +153,15 @@ impl TextView {
         self.inner = self.inner.on_link_click(f);
         self
     }
+    /// Scrolls a container that ignores scroll requests to the line of
+    /// `TextViewState::reveal_range`, with the line's window bounds.
+    pub fn on_reveal<F>(mut self, f: F) -> Self
+    where
+        F: Fn(Bounds<Pixels>, &mut Window, &mut App) + 'static,
+    {
+        self.inner = self.inner.on_reveal(f);
+        self
+    }
     /// Sets which Markdown extensions the parser accepts.
     pub fn markdown_extensions(mut self, value: MarkdownExtensions) -> Self {
         self.inner = self.inner.markdown_extensions(value);
@@ -238,13 +247,13 @@ impl Element for TextView {
             // caller ever replaced the theme -- a pointer comparison against
             // the shared default -- rather than comparing two whole themes
             // field by field.
-            #[cfg(feature = "tree-sitter")]
+            #[cfg(any(feature = "tree-sitter", feature = "syntect"))]
             if !std::sync::Arc::ptr_eq(
                 &style.highlight_theme,
                 &crate::highlighter::HighlightTheme::default_light(),
             ) {
-                inner = inner.code_block_highlighter(super::component_code_block_highlighter(
-                    style.highlight_theme.clone(),
+                inner = inner.shared_code_block_highlighter(super::shared_code_block_highlighter(
+                    &style.highlight_theme,
                 ));
             }
             inner = inner.style(resolve_component_style(
@@ -329,9 +338,17 @@ pub(super) fn resolve_component_style(
 
     let heading_base_font_size = legacy.heading_base_font_size;
     let heading_font_size = legacy.heading_font_size;
+    // A style that never touched heading sizes keeps the Base default, which
+    // scales headings with the body text; only an explicit base size or
+    // resolver pins them to pixels.
+    let pins_heading_size = heading_font_size.is_some()
+        || heading_base_font_size != TextViewStyle::default().heading_base_font_size;
     let style = themed
         .with_paragraph_gap(legacy.paragraph_gap)
         .with_heading(move |level| {
+            if !pins_heading_size {
+                return StyleRefinement::default();
+            }
             let default_size = match level {
                 1 => gpui::rems(2.),
                 2 => gpui::rems(1.5),

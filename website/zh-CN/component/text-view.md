@@ -7,9 +7,9 @@ description: 渲染 Markdown 与 HTML 文本，并支持自定义 Markdown 插�
 
 `TextView` 用于在 GPUI 中渲染格式化文本。它支持 Markdown、简单 HTML、文本选择、代码块操作，以及通过 Markdown 插件解析和渲染项目自定义语法。
 
-标准实现现在位于 `gpui-base`；本模块保留兼容重导出和组件主题适配。仅使用 Base 时的设置、完整默认样式及可选语法高亮请参阅 [GPUI Base TextView](/zh-CN/base/text-view)。
+标准实现现在位于 `gpui-base`；本模块保留兼容重导出和组件主题适配。仅使用 Base 时的设置、完整默认样式及可选语法高亮请参阅 [GPUI Base TextView](../base/text-view.md)。
 
-`TextView::selectable(true)` 使用 `gpui-base` 提供的窗口级文本选择引擎。如果要让普通文本或自定义 renderer 参与同一选择，请参阅 [GPUI Base Text Selection](/base/text-selection)（英文）。
+`TextView::selectable(true)` 使用 `gpui-base` 提供的窗口级文本选择引擎。如果要让普通文本或自定义 renderer 参与同一选择，请参阅 [GPUI Base Text Selection](../base/text-selection.md)。
 
 ## 导入
 
@@ -46,6 +46,14 @@ TextView::markdown("preview", markdown_source)
 TextView::html("html-preview", "<strong>Hello</strong>")
 ```
 
+### 放在有底色的容器里
+
+没有显式设置 `.style()` 的 `TextView` 会跟随容器的文字颜色。如果底色与页面明暗相反，例如 `Filled` 样式的 [Bubble](bubble.md)，链接、次要文字、代码和表格背景、边框、选择色也会从这个颜色推算，并且不使用语法高亮，所以内容不需要额外设置样式：
+
+```rust
+Bubble::new().child(TextView::markdown("reply", text))
+```
+
 ### 流式文字淡入
 
 聊天回复是分块到达的。`stream_fade(true)` 会让每一块新文字在落点处淡入，而不是直接蹦出来，观感与 Claude 展示回复的方式一致：
@@ -56,13 +64,115 @@ TextView::new(&self.reply).stream_fade(true)
 
 淡入以渲染后的文字为准：`push_str`，或者 `set_text` 传入以当前文本为前缀的更长文本，新增的部分从透明渐变到正常颜色，用时 350ms、ease-out 曲线，这是从 Claude 实测得到的节奏：比模型每块 50–300ms 的到达间隔更长，于是相邻几块的淡入互相重叠，尾部呈现为一段渐变，而不是最新一块突然变实。代码块里的代码和表格单元格里的文字同样参与。流式过程中被补齐的 Markdown 标记（`**bo` 变成粗体 `bold`）只让发生变化的字形重新淡入，不会整段闪烁。替换当前内容的文本直接显示；系统开启减少动态效果时也直接显示。不开启就没有任何动画。
 
-需要自定义时长、缓动，或者让每块按词逐个浮现时，通过 `.motion(...)` 传入 `TextViewMotion`，详见 [GPUI Base TextView](/zh-CN/base/text-view#保留状态与动态更新)。
+需要自定义时长、缓动，或者让每块按词逐个浮现时，通过 `.motion(...)` 传入 `TextViewMotion`，详见 [GPUI Base TextView](../base/text-view.md#保留状态与动态更新)。
+
+### 高亮文本范围
+
+应用在文档里搜索，或者指向文档里的某处引用时，用 `set_range_highlights` 把这些范围标出来。搜索由应用负责：在视图显示的文本 `rendered_text()` 里找到范围，连同绘制用的颜色一起交回，当前结果用更醒目的颜色：
+
+```rust
+use gpui_kit::component::{
+    ActiveTheme as _,
+    text::{RangeHighlight, RangeHighlightError, TextViewState},
+};
+
+fn highlight_matches(
+    state: &mut TextViewState,
+    query: &str,
+    current_match: usize,
+    cx: &mut Context<TextViewState>,
+) -> Result<(), RangeHighlightError> {
+    let (color, current_color) = (cx.theme().warning.opacity(0.3), cx.theme().warning);
+    let text = state.rendered_text();
+    let matches = if query.is_empty() {
+        Vec::new()
+    } else {
+        text.as_str().match_indices(query).collect()
+    };
+    let highlights = matches.into_iter().enumerate().map(|(ix, (start, found))| {
+        RangeHighlight::new(
+            start..start + found.len(),
+            if ix == current_match { current_color } else { color },
+        )
+    });
+    state.set_range_highlights(highlights, cx)
+}
+```
+
+`rendered_text()` 与纯文本复制得到的文字一致：`hello **world**` 读作 `hello world`，转义字符已经还原，标题和列表的标记不在其中。偏移量是 UTF-8 字节偏移，`str` 搜索返回的范围可以直接传入；重复出现的词组按各自的位置区分。文本在第一次读取时才会生成。
+
+高亮绘制在文字背后、选区之下，换行、对齐、语法颜色、链接、选择和复制都保持不变。多个高亮重叠时，后面的覆盖前面的。跨越两个块的范围在两个块里分别绘制。不属于任何块的文字不会绘制：块之间的换行、表格单元格之间的空格、自定义块、HTML 块和 inline plugin 对象。只有起点在终点之后、超出范围或不在字符边界上的范围会被拒绝，同一批的整组高亮也一并拒绝。
+
+内容变化时，高亮会跟随它所在的块，保留到这个块里文字开始变化的位置为止。流式追加的文字（无论通过 `push_str` 还是 `set_text`）不影响前面的高亮；修改某处时，修改前后的高亮都会保留。表格单元格只按位置区分，因此修改表格内部时，被修改的那一行及其后各行单元格的高亮都会失效。视图会发出通知：观察这个 state，重新在新的 `rendered_text()` 里搜索即可。请在同一次 state 更新中计算范围并调用 `set_range_highlights`，确保范围对应当前文本。属于文字本身的背景（例如 `<mark>` 和语法高亮）会覆盖在范围高亮之上（行内代码的背景在高亮之下），高亮也不会随流式文字一起淡入。HTML 视图不支持范围高亮。
+
+如果应用保存的是 Markdown 源码里的范围，例如用户评论某段文字时 `selected_source_range()` 返回的范围，就在同一个 `rendered_text()` 上用 `range_for_source` 逐个转换：
+
+```rust
+use std::ops::Range;
+
+use gpui_kit::component::{
+    ActiveTheme as _,
+    text::{RangeHighlight, RangeHighlightError, TextViewState},
+};
+
+fn highlight_comments(
+    state: &mut TextViewState,
+    markdown: &str,
+    comments: &[Range<usize>],
+    cx: &mut Context<TextViewState>,
+) -> Result<(), RangeHighlightError> {
+    let text = state.rendered_text();
+    // 范围对应的是 `markdown`。它解析完成之前，视图显示的仍是之前的源码；
+    // 等视图发出通知后再转换一次。
+    if text.source() != markdown {
+        return Ok(());
+    }
+    let color = cx.theme().info.opacity(0.3);
+    let highlights = comments
+        .iter()
+        .filter_map(|comment| text.range_for_source(comment.clone()))
+        .map(|range| RangeHighlight::new(range, color));
+    state.set_range_highlights(highlights, cx)
+}
+```
+
+`range_for_source` 返回能包含该源码范围所渲染出的全部字符的最小范围。不渲染任何文字的源码（强调符号、标题和列表标记、代码围栏、表格竖线、链接地址）不影响结果，因此 `**bold**` 和 `bold` 转换出的范围相同。只要字符的源码有一部分落在范围内，这个字符就会被包含：`&amp;` 的一部分对应 `&`，inline plugin 对象源码的一部分对应该对象的全部文字。把选区报告的源码范围转换回来，得到的就是原来选中的范围；只是块之间的换行不对应任何源码，落在选区两端时不会包含在内：全选转换回来的范围不含最后一个块之后的换行。
+
+`rendered_text().source()` 是最近一次完成解析的源码。用 `push_str` 追加文字时，它是交给视图的文本的前缀；用 `set_text` 替换内容后，在新文本解析完成之前，它可能仍是之前那段不相干的文本。因此转换前要像示例那样，先确认它就是范围所对应的源码。范围为空、超出范围或不在字符边界上，或者没有渲染出任何文字时返回 `None`；HTML 视图总是返回 `None`。
+
+### 滚动到范围
+
+`reveal_range` 滚动到同一份文本里的某个范围，比如用户跳到下一个结果时的当前结果：
+
+```rust
+state.reveal_range(current_range, cx)?;
+```
+
+它把范围起点所在的那一行滚动到可见区域内，长段落中间的某一行也能定位到；这一行（或整块显示的块）已经可见时，视图保持不动。空范围会显示它所在位置的那一行。`scrollable` 视图自己滚动。按内容高度排版的视图会让最近的外层 `gpui::list` 滚动，聊天记录就是这种情况，前提是承载视图的那一行已经完成布局，这一行可能不在屏幕上时，先滚动到这一行。其他滚动容器（例如设置了 `overflow_y_scroll` 的 `div`）通过 `on_reveal` 滚动，回调会收到这一行在窗口坐标中的位置：
+
+```rust
+let scroll = scroll_handle.clone();
+TextView::new(&state).on_reveal(move |line, _, _| {
+    let viewport = scroll.bounds();
+    let mut offset = scroll.offset();
+    if line.bottom() > viewport.bottom() {
+        offset.y -= line.bottom() - viewport.bottom();
+    } else if line.top() < viewport.top() {
+        offset.y += viewport.top() - line.top();
+    }
+    scroll.set_offset(offset);
+})
+```
+
+不覆盖任何块文字的范围（例如自定义块里的文字）会把整个块滚动到可滚动视图的可见区域内。只执行最后一次请求。它像高亮一样跟随内容变化；如果它所在的文字发生变化、视图用 `max_lines` 限制了行数，或者一秒内无法显示，请求就会被取消，因此不会在很久之后才突然滚动。表格里横向滚出的文字不会被滚动出来；整块显示且比视图更高的块从下方滚入时，显示的是它的末尾；放在应用列表里的可滚动视图只滚动自身；共用同一个 state 的多个视图共用同一个请求。
+
+滚动请求只是尽力而为：返回 `Ok(())` 表示范围对当前文本有效、请求已被接受，并不表示视图已经滚动；请求被取消时也不会另行通知。
 
 ## 触摸选择
 
 在触摸屏上，长按会选中手指下的单词，手指按住不放时选区跟随手指移动。抬起手指后，选区上方会出现包含 `复制` 和 `全选` 的编辑菜单，并在选区两端各显示一个拖动 handle。拖动 handle 会移动对应的一端，另一端保持不动；`全选` 选中被按下的那个视图，其 handle 仍可继续调整结果。
 
-handle 和菜单由 [`Root`](/zh-CN/component/root) 为整个窗口选区绘制，因此跨多个视图的选区也能覆盖到。点击其他位置会清除它们；手指滚动内容时菜单会暂时让开。
+handle 和菜单由 [`Root`](./root.md) 为整个窗口选区绘制，因此跨多个视图的选区也能覆盖到。点击其他位置会清除它们；手指滚动内容时菜单会暂时让开。
 
 ## 图片
 

@@ -161,6 +161,22 @@ pub enum BackgroundKind {
     },
 }
 
+/// Retained description of one GPUI `BoxShadow`, as a script wrote it.
+///
+/// The colour stays the literal the script passed, like [`BackgroundSpec`]'s,
+/// so a spec dump reads back what was written; it is parsed when the style is
+/// applied. `blur` keeps CSS semantics (twice the gaussian deviation) and is
+/// halved only when converted, see [`ShadowSpec::resolve`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShadowSpec {
+    pub x: f32,
+    pub y: f32,
+    pub blur: f32,
+    pub spread: f32,
+    pub color: String,
+    pub inset: bool,
+}
+
 #[derive(Clone)]
 pub(crate) struct ModuleComponentSpec {
     pub(crate) module: SharedString,
@@ -198,6 +214,36 @@ pub(crate) enum TextViewFormat {
     Markdown,
 }
 
+/// A document keeps the authority of the script that described it. Image
+/// loads happen in later native rendering phases, after the script scope ends.
+#[derive(Clone)]
+pub(crate) struct TextViewSpec {
+    pub(crate) id: SharedString,
+    pub(crate) text: SharedString,
+    pub(crate) format: TextViewFormat,
+    pub(crate) policy: Rc<crate::policy::Policy>,
+}
+
+impl std::fmt::Debug for TextViewSpec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TextViewSpec")
+            .field("id", &self.id)
+            .field("text", &self.text)
+            .field("format", &self.format)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for TextViewSpec {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.text == other.text
+            && self.format == other.format
+            && Rc::ptr_eq(&self.policy, &other.policy)
+    }
+}
+
 /// Which constructor produced a node.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Component {
@@ -205,11 +251,7 @@ pub(crate) enum Component {
     HFlex,
     VFlex,
     Module(ModuleComponentSpec),
-    TextView {
-        id: SharedString,
-        text: SharedString,
-        format: TextViewFormat,
-    },
+    TextView(TextViewSpec),
     /// A retained nested script view. The frozen description keeps the entity
     /// itself alive, so releasing the numeric handle cannot invalidate a frame
     /// that was already published.
@@ -647,7 +689,7 @@ impl Component {
             Component::HFlex => "h_flex",
             Component::VFlex => "v_flex",
             Component::Module(_) => "module_component",
-            Component::TextView { .. } => "TextView",
+            Component::TextView(_) => "TextView",
             Component::ChildView(_) => "child_view",
             Component::Text(_) => "text",
             Component::Registered(component) => component.name(),
@@ -836,19 +878,58 @@ impl SpecNode {
 /// inside the layout pass that asked for it, so nothing a row described
 /// outlives the frame that drew it — and two batches cannot see each other's
 /// nodes.
+///
+/// A batch whose rows registered handlers carries them in a snapshot of its
+/// own: its callback generation is retired when the last element drawn from it
+/// is dropped, which is when the next frame replaces this one.
 pub struct ItemSpecs {
-    arena: SpecArena,
+    batch: ItemBatch,
     roots: SmallVec<[SpecId; 16]>,
     keys: Vec<String>,
 }
 
+enum ItemBatch {
+    /// Rows that registered no handler: nothing has to outlive the layout pass.
+    Plain(SpecArena),
+    /// Rows that did, with the generation that owns their handlers.
+    Recorded(crate::snapshot::RenderSnapshot),
+}
+
 impl ItemSpecs {
     pub(crate) fn new(arena: SpecArena, roots: SmallVec<[SpecId; 16]>, keys: Vec<String>) -> Self {
-        Self { arena, roots, keys }
+        Self {
+            batch: ItemBatch::Plain(arena),
+            roots,
+            keys,
+        }
+    }
+
+    pub(crate) fn recorded(
+        snapshot: crate::snapshot::RenderSnapshot,
+        roots: SmallVec<[SpecId; 16]>,
+        keys: Vec<String>,
+    ) -> Self {
+        Self {
+            batch: ItemBatch::Recorded(snapshot),
+            roots,
+            keys,
+        }
     }
 
     pub fn arena(&self) -> &SpecArena {
-        &self.arena
+        match &self.batch {
+            ItemBatch::Plain(arena) => arena,
+            ItemBatch::Recorded(snapshot) => snapshot.arena(),
+        }
+    }
+
+    /// What keeps this batch's handlers callable, if its rows registered any.
+    /// Every element drawn from the batch has to hold it.
+    pub(crate) fn lease(&self) -> Option<crate::snapshot::RenderSnapshot> {
+        match &self.batch {
+            ItemBatch::Plain(_) => None,
+            ItemBatch::Recorded(snapshot) => Some(snapshot.clone()),
+        }
     }
 
     /// One root per item, in the order the script returned them.
@@ -1292,14 +1373,14 @@ impl SpecArena {
                 " {}.{} {:?} props={:?}",
                 spec.module, spec.component, spec.id, spec.props
             )),
-            Component::TextView { id, text, format } => out.push_str(&format!(
+            Component::TextView(spec) => out.push_str(&format!(
                 " {} {:?} {:?}",
-                match format {
+                match spec.format {
                     TextViewFormat::Html => "html",
                     TextViewFormat::Markdown => "markdown",
                 },
-                id,
-                text,
+                spec.id,
+                spec.text,
             )),
             Component::Text(value)
             | Component::Button(value)

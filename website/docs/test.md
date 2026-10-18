@@ -1,7 +1,7 @@
 ---
 title: Testing
 description: Test GPUI Kit applications and GPUI behavior with Rust unit tests, TestAppContext, native UI interactions, layout assertions and CI.
-order: -11
+order: -3.39
 example: false
 ---
 
@@ -10,8 +10,8 @@ example: false
 This guide covers testing GPUI Kit applications and GPUI behavior. Choose the test level from the behavior you need to verify:
 
 - Use ordinary Rust `#[test]` for pure data transformations, validation and state transitions.
-- Use `#[gpui_kit::test]` and `TestAppContext` for entities, actions, subscriptions and async tasks, creating a window when needed.
-- For UI integration tests, render the production application view, dispatch events through `gpui_kit::test`, and check control state, layout and the application result.
+- Use `#[gpui_kit::test]` and `TestAppContext` for [entities](./entity), [actions](./action), [subscriptions](./event) and async [tasks](./task), creating a window when needed.
+- For UI integration tests, render the production application view, dispatch [events](./event) through `gpui_kit::test`, and check control state, layout and the application result.
 - Use the separate offscreen renderer for pixel checks, and retain native-window and platform integration tests for those behaviors.
 
 GPUI Kit exposes its types and `#[gpui_kit::test]` through the Kit root; applications do not need an additional GPUI dependency. In test modules, import the types you use explicitly: `use gpui_kit::*;` also imports the GPUI `test` macro and can shadow Rust’s ordinary `#[test]`. The complete example below uses explicit imports.
@@ -34,7 +34,7 @@ use gpui_kit::test::TestWindowExt;
 
 Use these tests when a behavior depends on components working together, such as
 entering a value, saving a dialog and checking the result in the parent view.
-Find controls by `ElementId`, dispatch real GPUI events and assert the outcome
+Find controls by [`ElementId`](./element_id), dispatch real GPUI events and assert the outcome
 with ordinary Rust assertions.
 
 This guide covers in-process behavior and layout automation. Element snapshots do not inspect pixels or launch your packaged application.
@@ -58,6 +58,7 @@ workspace/
   ui-tests/
     Cargo.toml
     tests/ui.rs
+    tests/common/mod.rs
 ```
 
 Put the following in `ui-tests/Cargo.toml`:
@@ -81,30 +82,38 @@ uses the component crate directly can enable `gpui-component/test-support`.
 
 ## A complete test
 
-Copy the following into `tests/ui.rs`. The example uses GPUI Kit's facade,
-initializes the component library and wraps the view in `Root`. It retains the
-input state on the view, as a real application should.
+The source below is the repository's compiled `tests/ui.rs`. It initializes
+the component library and retains the input state on the view, as a real
+application should. Its `mod common;` line loads the companion
+`tests/common/mod.rs` fixture. That fixture calls the public
+`gpui_kit::open_window` with explicit 640 × 480 bounds, wraps the view in
+`gpui_kit::base::Root`, and returns both the window handle and the view entity.
+It is test setup, not an additional library dependency.
 
 The test enters a Unicode name, edits it with Backspace, clicks Save, checks
-the accessible status announcement and layout, and verifies the saved application value. The same
-source is compiled and run in GPUI Kit's integration suite.
+the status node's AccessKit role and label plus layout, and verifies the saved
+application value. The same source is compiled and run in GPUI Kit's
+integration suite. These assertions do not verify what a screen reader actually
+announces; check that in the running app on each target platform.
 
 <<< ../../crates/kit/tests/ui.rs{rust}
 
-In your own application, import the production view and its constructor from
-your library crate. Keeping a second implementation of the view in the test
-would allow the test and application to diverge. This example defines its view
-inline only so the entire test can be copied into a new package.
-
-From `ui-tests/`, run:
+For the standalone layout above, copy **both** files from the Kit checkout;
+`ui.rs` alone will fail at `mod common;`. From `ui-tests/`, run:
 
 ```sh
+mkdir -p tests/common
+cp ../gpui-kit/crates/kit/tests/ui.rs tests/ui.rs
+cp ../gpui-kit/crates/kit/tests/common/mod.rs tests/common/mod.rs
 cargo generate-lockfile
 cargo test --test ui --locked
 ```
 
-Commit `Cargo.lock` with the test project. Inside the GPUI Kit checkout, run
-this exact example with:
+Commit `Cargo.lock` with the test project. In your application, import its
+production view and constructor instead of copying the example's `Profile`;
+keep the same window setup and interaction pattern. A separate test view can
+drift from the application. Inside the GPUI Kit checkout, run this exact test
+with:
 
 ```sh
 cargo test -p gpui-kit --features test-support --test ui --locked
@@ -136,6 +145,8 @@ observation adds no layout container:
 | Dialog / Sheet | Host focus scope and surface bounds; child controls retain their own properties |
 | Menu | Item label and selection, menu focus scope and submenu bounds |
 | Notification | Alert role and bounds; close button uses normal Button observation |
+| Progress / ProgressCircle | Progress indicator role and label; numeric accessibility values are not exposed by `ElementSnapshot::value()` |
+| TitleBar | `title-bar` and `window-controls` bounds; caption buttons (`minimize`, `maximize` or `restore`, `close`) only where the title bar draws them |
 | Dock | Area/group/content bounds and focus scopes; tabs retain native selection |
 
 Use constructor IDs where available. Input and Select accept `.id("name")`;
@@ -211,24 +222,36 @@ IDs such as `("row", record_id)` preserve record identity after reordering.
 
 ## Interact and assert
 
-Import `gpui_kit::test::TestWindowExt` for the following methods:
+Import `gpui_kit::test::TestWindowExt` for queries and interactions:
 
 | API | Behavior |
 | --- | --- |
 | `window.find(id)` | Requires an `ElementSnapshot` from the last completed frame; missing targets panic with registered paths and troubleshooting hints. |
 | `window.try_find(id)` | Returns `None` when absent; ambiguity still panics. |
+| `window.find_all(id)` | Returns all registered matches, including invisible ones, by current-frame bounds origin (y, then x); equal-origin order is unspecified. Empty when absent. |
 | `window.click(id, cx)` | Native mouse move/down/up at the target center. |
 | `window.click_at(id, offset, cx)` | Click at a pixel offset from the target's top-left corner, useful for partial clipping. |
+| `window.click_with_modifiers(id, modifiers, cx)` | Centered left click with modifiers; sends modifier changes and restores the previous modifier state afterward. |
+| `window.click_with_options(id, options, cx)` | Combines offset, button, count, and modifiers using `ClickOptions`; restores the previous modifier state afterward. |
 | `window.right_click(id, cx)` / `double_click(id, cx)` | Native right-button or two-click sequences. |
 | `window.hover(id, cx)` | Move the pointer without pressing a button. |
 | `window.scroll(id, delta, cx)` | Native wheel event; `ScrollDelta` retains GPUI units and sign. |
 | `window.drag_to(from_id, to_id, cx)` | Resolve both targets and drag between their centers using native hit testing. |
 | `window.drag(from, to, cx)` | Left-button drag between window-local points, through GPUI drag creation and drop hit testing. |
-| `window.press("backspace", cx)` | Named key or shortcut using GPUI's keystroke parser. |
+| `window.press("backspace", cx)` | Native key-down/key-up for a named key or shortcut using GPUI's keystroke parser. |
 | `window.input(text, cx)` | Per-character text input to the current focus; does not focus or replace the whole value. |
 
-Scoped queries support `find`, `try_find`, nested `within`, `click`, `click_at`,
-`right_click`, `double_click`, `hover`, `scroll`, `drag_to`, `press` and `input`.
+`ClickOptions::new()` defaults to one left click at the center without modifiers.
+For example, `ClickOptions::new().with_offset(point(px(8.), px(8.)))
+.with_button(MouseButton::Right).with_count(2).with_modifiers(Modifiers::shift())`
+combines a local offset, right double-click, and Shift. Counts must be positive.
+Configurable clicks preserve caps lock. `find_all` ordering is geometry for the
+current frame, not stable identity, paint order, or business order; filter with
+`visible()` when counting visible matches.
+
+Scoped queries support `find`, `try_find`, `find_all`, nested `within`, `click`,
+`click_at`, `click_with_modifiers`, `click_with_options`, `right_click`, `double_click`, `hover`, `scroll`,
+`drag_to`, `press` and `input`.
 `drag_to` resolves both IDs within the scope. For cross-scope drags or custom offsets,
 query the targets and pass window-local points to `window.drag`.
 
@@ -270,8 +293,92 @@ Assert native properties and application results together. Checking saved model
 state or an emitted result is a useful part of an integration test; it should
 not replace verifying the relevant visible control state.
 
-Text input does not model complete OS IME composition. Masked inputs report
+Command presses, including Enter, must not inject newline text through an IME
+callback. Text input does not model complete OS IME composition. Masked inputs report
 no value; verify sensitive results through application state.
+
+## Inspect accessibility targets and individual events
+
+Import `gpui_kit::test::{TestQueryExt, TestEventExt}` for additional observation
+and event control. `elements()` returns observed elements in the current frame;
+`find_by_label(label)`, `try_find_by_label(label)` and `find_all_by_label(label)`
+match exact, case-sensitive native accessibility labels. `find_all_by_role(role)` selects an
+AccessKit `Role`. Results include invisible registrations, ordered by y, then x
+and a path tie-breaker. Required queries panic on absence; all unique queries
+panic on ambiguity. Scoped queries include strict descendants, excluding the
+scope node itself. These queries also work inside `within` and do not discover
+unobserved text or offscreen virtual rows. A label is an accessibility name,
+not rendered text; use stable IDs when localization changes the name.
+The pinned GPUI version does not expose an enumeration of anonymous rendered
+text. Kit therefore has no general rendered-text `HasText` assertion; exact
+accessible-label queries cannot establish that text was actually drawn.
+
+For gestures whose intermediate state matters, dispatch each step explicitly:
+
+```rust
+use gpui_kit::test::TestEventExt;
+
+let start = window.find("handle").bounds().center();
+window.pointer_down(start, MouseButton::Left, cx);
+window.pointer_move(start + point(px(24.), px(0.)), Some(MouseButton::Left), cx);
+// Assert the state while the pointer is still held.
+window.pointer_up(start + point(px(24.), px(0.)), MouseButton::Left, cx);
+```
+
+Positions use window-local pixels. `pointer_move(position, pressed_button, cx)`
+receives the held button explicitly; these helpers do not remember button state.
+`pointer_down` and `pointer_up` dispatch one click event each. Ordinary click, hover, scroll, drag and individual pointer steps use
+the window's current modifiers. Configurable clicks temporarily use their
+explicit modifiers and restore the preceding state afterward. `change_modifiers(modifiers, cx)` changes them and
+preserves caps lock; restore the previous modifiers when the gesture ends.
+`key_down(key, is_held, cx)` and `key_up(key, cx)` allow separate key transitions
+and auto-repeat (`is_held = true`). Key events combine modifiers written in the
+key string with the window's held modifiers, without changing the retained
+modifier state. Each step refreshes before dispatch and
+completes a frame afterward. These key events do not insert text; use `input`
+for typing. Leave the window update and wait for deferred results when needed.
+
+## Exercise text composition through an input handler
+
+`gpui_kit::test::TestInput` bridges an explicit GPUI `InputHandler` to a window.
+For an entity implementing `EntityInputHandler`, construct the adapter with
+`gpui_kit::ElementInputHandler::new(bounds, entity.clone())`, then pass it to
+`TestInput::new(handler, window)`. Keep the entity owned by the
+production view and use its actual input geometry. This bridge calls that
+handler directly; it does not select the focused control or run an OS IME.
+
+`commit_text(text, cx)` commits through `replace_text_in_range`.
+`compose_text(replacement, text, selection, cx)` updates marked text through
+`replace_and_mark_text_in_range`. Replacement and selection ranges use UTF-16
+code units, not UTF-8 byte offsets; selection is relative to the composed text.
+With no replacement range, the handler replaces its current marked range or
+selection. Empty composition text cancels preedit according to the handler.
+`marked_text_range(cx)` returns a document-relative range;
+`selected_text_range(cx)` returns `Option<UTF16Selection>`, including direction;
+`unmark_text(cx)` ends marking while retaining its text. Mutation helpers complete a frame after the
+handler call. They can test composition transitions and commit behavior, while
+platform candidate windows, focus routing and OS IME integration still need
+native tests. Use `window.input` for ordinary text typed at the current focus.
+
+## Resize, display scale and clipboard
+
+Use GPUI's existing `TestAppContext::simulate_window_resize(handle, size)` and
+`simulate_window_scale_factor_change(handle, scale)` outside a window update,
+then call `render_frame` before inspecting layout. Pointer positions remain
+window-local logical pixels at every display scale. Assert both preserved
+editing state and resized geometry, then activate a control at its new bounds.
+
+Exercise clipboard behavior through production shortcuts (`secondary-c`,
+`secondary-x`, `secondary-v`) and inspect `cx.read_from_clipboard()` when needed.
+The test platform shares its clipboard across windows; editor state should
+remain window-specific. This verifies the test-platform adapter and application
+bindings, not the operating system's clipboard service.
+
+After activating an external Link, inspect `cx.opened_url()` to verify the URL
+received by the test platform and assert the application's click callback.
+This does not establish that a browser opened the destination. The test
+platform exposes no cursor-style reader; URL and callback assertions do not
+verify the pointer cursor.
 
 ## Complete the frame before querying
 
@@ -332,18 +439,55 @@ that every option or combination of every component has been exhaustively tested
 | Suite | Behavior exercised |
 | --- | --- |
 | `test_macro.rs` | Published `#[gpui_kit::test]` sync/async compatibility alongside ordinary Rust tests; the independent Kit-only recipes package runs the same contract |
+| `input.rs` and `input/` | Input, Textarea and Editor editing, clipboard, selection, history, read-only transitions, Unicode, multiline viewport behavior, search/replace, completion acceptance and retained state across renders |
+| `input_focus.rs` | Repeated Tab/Shift-Tab traversal with passive addons, addon button focus and activation, and Textarea/Editor body-click focus followed by editing |
 | `search.rs` | Command disabled-item skipping, wraparound, Unicode keywords, empty results, Action dispatch and original-index callbacks, two-stage Escape; Combobox search, single/multi selection, clearing, empty-result recovery, disabled behavior and exactly one Confirm on close |
 | `disclosure.rs` | Accordion exclusive expansion/collapse and actual panel geometry; Stepper content navigation; disabled disclosure/steps; Slider track click, thumb drag and disabled behavior |
 | `collections.rs` | Tree pointer expansion, keyboard collapse/expansion and selection; DataTable row selection, keyboard virtualization and wheel scrolling |
+| `query_helpers.rs` | Exact accessible labels and roles, scoped ambiguity, invisible registrations and immutable snapshots |
+| `event_helpers.rs` | Separate pointer/key transitions, auto-repeat and retained modifiers |
+| `control_steps.rs` | Button drag-out cancellation, Checkbox key repeat and Switch disabled before key release |
+| `slider_steps.rs` | Live track/drag changes, release ordering and disabled gestures |
+| `semantic_controls.rs` | Scoped RadioGroup accessible names, controlled state and item/group disabled behavior |
+| `collection_steps.rs` | List release modifiers, drag-out cancellation, repeated navigation and confirmation |
+| `composition_helpers.rs` | Explicit input-handler bridge, UTF-16 preedit, whole-text commit, cancellation and multiline Textarea/Editor undo/readonly transitions |
+| `environment.rs` | Resize and display scale, cross-window clipboard, Link URL requests and owner callbacks |
 | `date_picker.rs` | Opening, exact preset/day selection, month navigation, clearing, Escape and disabled behavior |
 | `overlays.rs` | Dialog validation → scoped Input → save → Notification; hover-revealed close; auto-dismiss timer; Dialog/Sheet Escape and focus restoration; surface bounds |
-| `menu.rs` | Disabled items, keyboard confirmation, Escape, focus restoration, submenu hover and nested item activation |
+| `menu.rs` | Disabled items, keyboard confirmation, Escape, focus restoration, submenu hover, nested item activation and innermost context-menu ownership |
 | `dock.rs` | Tab selection/reordering, cross-group drag/drop, zoom and restored split geometry |
 
 The existing form, Select, HoverCard, virtual-list, pointer, lifecycle and isolation
 suites remain in place. Pure presentation components need geometry or pixel assertions,
 not invented interaction state. Custom parts register their existing native elements;
 unsupported properties remain unavailable, with no manual test-only override.
+
+The [Input regression example](https://github.com/longbridge/gpui-kit/tree/main/crates/kit/tests/input)
+shows how to turn a manual editing sequence into a repeatable UI test. From the
+repository root, run both editing and focus targets, or select one workflow:
+
+```sh
+script/test-input # Complete Input gate: Base, Component and Kit workflows (Bash).
+cargo test -p gpui-kit --features test-support --test integration --locked -- input:: input_focus::
+cargo test -p gpui-kit --features test-support --test integration --locked -- input::history::paste_is_atomic_and_separate_from_surrounding_typing --exact
+cargo test -p gpui-kit --features test-support --test integration --locked -- input_focus::reverse_tab_cycles_three_inputs_with_passive_addons --exact
+```
+
+Append `-- --list` to the combined command to list cases without executing them.
+These commands are reproduction instructions, not recorded passing results. Report
+the revision, platform, command and observed result for each run.
+
+Example workflows include typing → paste → typing → Undo/Redo, Textarea Enter
+submission versus Shift-Enter insertion, and Editor completion → acceptance → Undo.
+Each checks fresh snapshots plus public state or owner events where needed.
+Completion responses come from a deterministic provider, not a live language server.
+The suite also exercises the public IME handler protocol (preedit, UTF-16 ranges,
+commit/cancel and history), multi-cursor editing, folding, provider cancellation
+and failure. Its operation matrix is the review checklist for ordinary input
+changes; add a regression for the changed interaction and require platform CI.
+The separate `input_focus` target exercises focus callbacks after window updates.
+These cases do not establish full OS IME, accessibility action, system clipboard
+or pixel correctness; use the corresponding platform checks for those boundaries.
 
 Views that open dialogs, sheets or notifications through `WindowExt` need a `Root`
 as the window's root view. `Root` always renders all three overlay layers above
@@ -370,31 +514,48 @@ No GPUI fork or Cargo patch is used to bypass these limitations.
 On failure, check the reported paths, observation, completed frame, keyboard
 focus, clipping/overlays and asynchronous completion, in that order as relevant.
 
+| Symptom | First check |
+| --- | --- |
+| `mod common` cannot be found | Copy `tests/common/mod.rs` beside the included `tests/ui.rs`, or replace the fixture call with your application's window setup. |
+| `find` lists no matching path | Confirm `test-support`, the control's ID or `.test_support()`, and an initial `render_frame`. |
+| A query is ambiguous | Resolve an existing parent with `within`, then query its child ID. |
+| `focused()` reports a missed binding, or scoped `input` panics | Observe the element before `.track_focus(&handle)` and click the intended input before typing. |
+| An assertion still sees the old state | Query a fresh snapshot after a completed frame; for queued work, leave `update_window` and use `wait_for`. |
+| A visible target does not receive the click | Inspect clipping and overlay order; pointer helpers use native hit testing. |
+
 ## Verify rendering independently
 
 A correct value or checked flag does not prove the control was drawn correctly.
 GPUI exposes `HeadlessAppContext::with_platform`, `Window::render_to_image` and
 `HeadlessAppContext::capture_screenshot` for real offscreen images. The currently
-pinned platform crate supplies its headless renderer on macOS (Metal) only. Run
-this target on a Mac with Metal available:
+pinned GPUI {{gpui_pre_version}} platform crate supplies headless renderers on macOS (Metal)
+and Linux (WGPU). Run this target with a working Metal or WGPU adapter; Linux
+can use a software Vulkan adapter such as Mesa lavapipe:
 
 ```sh
 cargo test -p gpui-kit --features test-support --test rendering --locked
 ```
 
 The target uses `test = false`, so the default Cargo command does not select it.
-The macOS CI job explicitly runs `--test rendering` as a required step, alongside
-the portable interaction suite. Linux and Windows run only the portable suite. Cargo supports this
+The macOS and Linux CI jobs explicitly run `--test rendering` as a required
+step, alongside the portable interaction suite. Windows runs the portable suite. Cargo supports this
 [explicit target selection](https://doc.rust-lang.org/cargo/commands/cargo-test.html#target-selection).
 It also uses `harness = false` because AppKit initialization requires the main
 thread; `--test-threads=1` would still run an ordinary Rust test on a worker thread.
-On other platforms it explicitly reports that pixel verification is skipped.
-Missing renderer support on macOS fails rather than substituting a fake image.
+Windows explicitly reports that pixel verification is skipped because the pinned
+platform crate has no Windows headless renderer. Missing renderer support on
+macOS or Linux fails rather than substituting a fake image.
 
 The tests inject two defects into real Kit controls: a missing check-mark asset
 while `checked()` remains true, and transparent input text while `value()` remains
 correct. Images must differ from the working control, and repeated working checkbox
-renders must match. A separate native-event test disconnects a checkbox's change
+renders must match. Controlled Checkbox cases also check that pointer-down leaves
+the owner value and pixels unchanged, while pointer-up updates both exactly once
+in light and dark themes. The suite also checks wrapped CJK text with inline code,
+focus-line placement and contrast in light and dark themes, pointer activation
+without a button focus line, a single menu highlight across pointer/key transitions,
+list keyboard selection, and table keyboard-only focus with the focus ring enabled
+and disabled. A separate native-event test disconnects a checkbox's change
 handler and checks that clicking cannot fabricate a checked result.
 
 These are sensitivity checks, not a complete golden-image suite. For application
@@ -402,12 +563,13 @@ visual regression, compare images against reviewed expectations under controlled
 fonts, dimensions, theme, focus and animation state. State assertions and image
 assertions detect different defects; neither establishes packaged-app or full IME
 correctness. The executable rendering examples are in
-[`crates/kit/tests/rendering.rs`](https://github.com/longbridge/gpui-kit/blob/testing/crates/kit/tests/rendering.rs).
+[`crates/kit/tests/rendering.rs`](https://github.com/longbridge/gpui-kit/blob/main/crates/kit/tests/rendering.rs).
 
 ## Run in CI
 
 The Kit repository runs the interaction/layout suite on macOS, Linux and Windows.
-The macOS job additionally runs the two Metal pixel checks; a failure fails the job.
+The macOS and Linux jobs additionally run the full rendering suite using Metal
+and WGPU respectively; a failure fails the job.
 A minimal macOS workflow for a Kit checkout is:
 
 ```yaml

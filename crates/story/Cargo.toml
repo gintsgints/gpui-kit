@@ -1,10 +1,11 @@
 [package]
 name = "gpui-component-story"
-version = "0.6.5"
+version = "0.7.3"
 publish = false
 edition.workspace = true
 
 [features]
+gpui-fast = ["gpui-kit/gpui-fast", "gpui-fps/gpui-fast", "gpui-shell/gpui-fast"]
 inspector = ["gpui-kit/inspector"]
 tree-sitter = ["gpui-kit/tree-sitter-languages"]
 test-support = ["gpui-kit/test-support"]
@@ -12,7 +13,7 @@ default = ["tree-sitter"]
 
 [dependencies]
 anyhow.workspace = true
-gpui-kit.workspace = true
+gpui-kit = { workspace = true, features = ["speech"] }
 gpui-fps.workspace = true
 
 async-channel = "2.3.1"
@@ -37,7 +38,9 @@ dirs = "6.0.0"
 
 # Native-only dependencies (not available on WASM)
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-gpui-shell.workspace = true
+# Without `webview`: `gpui-webview` enables GPUI Fast, which feature
+# unification would spread to every workspace member built with the Story.
+gpui-shell = { path = "../shell", default-features = false, features = ["quickjs", "components"] }
 reqwest_client.workspace = true
 smol.workspace = true
 

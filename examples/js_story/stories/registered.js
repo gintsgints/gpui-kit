@@ -1,6 +1,6 @@
-// These exports are public constructors from the current component-shell
-// inventory. Constructor calls intentionally use `new`, matching the generated
-// gpui-component declarations.
+// These exports are public constructors from the inventory of gpui-shell's
+// `components` catalog. Constructor calls intentionally use `new`, matching the
+// generated gpui-component declarations.
 import { div } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
 import {
@@ -44,6 +44,8 @@ import {
   DescriptionItem,
   DescriptionList,
   Dialog,
+  Diff,
+  DiffState,
   DropdownButton,
   DropdownMenu,
   Editor,
@@ -143,6 +145,7 @@ import {
   TextareaState,
   TimeField,
   TimeFieldState,
+  TitleBar,
   Stepper,
   StepperItem,
   SuccessAlert,
@@ -161,6 +164,18 @@ import {
  * @param {unknown} value
  * @returns {import("gpui-kit").Element}
  */
+const REVIEW_PATCH = [
+  "diff --git a/src/retry.rs b/src/retry.rs",
+  "--- a/src/retry.rs",
+  "+++ b/src/retry.rs",
+  "@@ -1,3 +1,3 @@",
+  " fn retry_delay(attempt: u32) -> u64 {",
+  "-    100 * attempt as u64",
+  "+    100 * 2_u64.pow(attempt.min(6))",
+  " }",
+  "",
+].join("\n");
+
 const asElement = (value) =>
   /** @type {import("gpui-kit").Element} */ (/** @type {unknown} */ (value));
 
@@ -295,6 +310,7 @@ export function initializeRegisteredExamples() {
     EditorState("fn main() {\n    println!(\"hello\");\n}", "rust"),
   );
   retained("editor-readonly", () => EditorState("// generated, do not edit", "rust"));
+  retained("diff-review", () => DiffState(REVIEW_PATCH));
 }
 
 /**
@@ -1871,6 +1887,32 @@ export function registeredExamples(surface, cx) {
           ),
         },
       ];
+    case "TitleBar":
+      return [
+        {
+          label: "Window title bar",
+          description:
+            "The bar above this gallery is the same component. Pressing an empty part of it moves the window; the trailing buttons stop that press so they stay clickable.",
+          element: asElement(
+            div()
+              .w_full()
+              .border(1)
+              .child(
+                asElement(
+                  new TitleBar()
+                    .child(asElement(new Text("Untitled document")))
+                    .child(
+                      h_flex()
+                        .px(8)
+                        .gap(4)
+                        .on_mouse_down("left", (_event, cx) => cx.stop_propagation())
+                        .child(asElement(new Button("title-bar-share").ghost().size("small").label("Share"))),
+                    ),
+                ),
+              ),
+          ),
+        },
+      ];
     case "Toolbar":
       return [
         {
@@ -2959,6 +3001,17 @@ export function registeredExamples(surface, cx) {
                   ),
               ),
             ),
+        },
+      ];
+    case "Diff":
+      return [
+        {
+          label: "Unified patch",
+          element: asElement(
+            new Diff(retained("diff-review", () => DiffState(REVIEW_PATCH)))
+              .w_full()
+              .h(220),
+          ),
         },
       ];
     case "Editor":

@@ -19,7 +19,7 @@ gpui-kit             应用唯一需要依赖的 crate
 └── gpui-component   GPUI Component：完整的带样式 UI 系统
 ```
 
-`gpui-kit` 会固定配套的 GPUI 版本并导出 GPUI、base、component 和 assets，Rust 应用只需声明这一个依赖。JavaScript 扩展宿主另行依赖 `gpui-shell`；`gpui-component-shell` 提供带样式的组件目录。
+`gpui-kit` 会固定配套的 GPUI 版本并导出 GPUI、base、component 和 assets，Rust 应用只需声明这一个依赖。JavaScript 扩展宿主另行依赖 `gpui-shell`；它默认开启的 `components` feature 提供带样式的组件目录。
 
 ## 特性
 
@@ -100,10 +100,25 @@ GPUI Kit 从第一天起就用于构建 [Longbridge Pro](https://longbridge.com/
 
 ```toml
 [dependencies]
-gpui-kit = "0.6"
+gpui-kit = "0.7"
 ```
 
 `gpui-kit` 始终引入 GPUI 和 `gpui-base`；`gpui-component` 和默认图标集默认开启。只想保留部分层时关闭默认 feature 按需选择即可。`gpui-component` 的 feature（`inspector`、`decimal`、`tree-sitter` 及各 `tree-sitter-<language>`）在 `gpui-kit` 上同名可用。
+
+### GPUI Fast
+
+启用可选的 `gpui-fast` feature，可以为核心、原生平台、WebAssembly 和所有已启用的
+Kit 层统一选择 [GPUI Fast](https://github.com/longbridge/gpui-fast)：
+
+```toml
+[dependencies]
+gpui-kit = { version = "0.7", features = ["gpui-fast"] }
+```
+
+原有导入、初始化流程和测试宏保持不变，应用无需 `[patch]` 或 crate 别名。
+默认后端仍是固定版本的上游 GPUI 快照。Cargo features 是累加的，因此选择 Fast 后，
+上游包仍会参与编译。feature 组合和对比命令见
+[Getting Started](https://gpui-kit.com/zh-CN/docs/getting-started)。
 
 ### 基础示例
 
@@ -210,9 +225,15 @@ cargo run -p window_title
 
 请查看站点上的[与 Iced、egui、Qt 6 的对比](https://gpui-kit.com/zh-CN/docs/comparison)。
 
+## 相关项目:Native Shell
+
+[Native Shell](https://nsh.dev/zh-CN)([源码](https://github.com/longbridge/native-shell))是我们的兄弟项目,由 AI 生成 UI 并在 iOS、Android、Linux(GTK)和 macOS(AppKit)上原生渲染。它的 GPUI 桌面后端正在开发中,将基于 GPUI Kit 构建。
+
 ## 许可证
 
-Apache-2.0
+软件源码与文档中的代码示例适用 [Apache-2.0](LICENSE-APACHE)。
+
+Docs、Base、Component、Shell 各章节（含中文译文）中 GPUI Kit 有权授权的文档正文与原创图示，另以 [CC BY 4.0](LICENSE-DOCS.md) 提供。复制或改编这些内容时，请署名 **GPUI Kit**、链接到原文页面及 [CC BY 4.0 许可](https://creativecommons.org/licenses/by/4.0/)，并注明修改。既有 Apache-2.0 使用权持续有效；较早版本仍遵循当时的许可，第三方贡献未经权利人另外授权时保留原许可。仅学习概念或使用事实、未复制受版权保护的表达时，不因 CC BY 4.0 产生署名要求。
 
 - 基于 Zed Industries 的 [GPUI](https://github.com/zed-industries/zed) 构建，GPUI 同样采用 Apache-2.0。`gpui-pre-*` 是它的快照，发布时保留 Zed 的许可证与声明。
 - UI 设计基于 [shadcn/ui](https://ui.shadcn.com)，部分来自 [Reui](https://reui.io)。

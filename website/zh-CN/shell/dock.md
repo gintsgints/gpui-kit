@@ -1,7 +1,8 @@
 ---
-title: Dock 与面板
+title: Dock and Panels
 description: 完全由脚本绘制的可停靠布局——重启后仍在原处的面板、自己画的 chrome，以及用命令代替回调。
 order: 13
+maturity: [preview]
 ---
 
 # Dock 与面板
@@ -265,7 +266,7 @@ area.release();
 ## 一个完整的例子
 
 ```bash
-cargo run -p gpui-shell -- examples/js_dock
+cargo run -p gpui-shell -- run examples/js_dock
 ```
 
 `examples/js_dock/` 是一个工作区：左侧 dock 里是文件列表，中间是文档，标签栏与 dock 外框画在 `ui.js` 里，布局用定时器写进 `localStorage`。它是用上本页每一部分的最短的完整程序。

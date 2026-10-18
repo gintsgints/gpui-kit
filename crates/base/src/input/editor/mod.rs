@@ -166,13 +166,29 @@ impl InputModeKind for EditorMode {
         highlighter.update(Some(edit), text, folding, window, cx);
     }
 
+    fn drive_highlighter_batch(
+        highlighter: &std::rc::Rc<std::cell::RefCell<Option<Box<dyn super::InputHighlighter>>>>,
+        edits: &[(super::InputEdit, ropey::Rope)],
+        folding: bool,
+        window: &mut Window,
+        cx: &mut gpui::Context<InputBaseState<Self>>,
+    ) {
+        let mut highlighter = highlighter.borrow_mut();
+        let Some(highlighter) = highlighter.as_mut() else {
+            return;
+        };
+        highlighter.update_batch(edits, folding, window, cx);
+    }
+
     fn register_actions(
         element: Stateful<Div>,
         entity: &Entity<InputBaseState<Self>>,
         window: &mut Window,
     ) -> Stateful<Div> {
         element
+            .key_context("Input mode=editor")
             .on_action(window.listener_for(entity, InputBaseState::on_action_toggle_code_actions))
+            .on_action(window.listener_for(entity, InputBaseState::on_action_show_completions))
             .on_action(window.listener_for(entity, InputBaseState::on_action_go_to_definition))
     }
 }

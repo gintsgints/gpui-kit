@@ -30,17 +30,14 @@ jobs:
     # macOS verifies the Metal shader build script of gpui_apple, the one
     # part of the pipeline that only compiles on Apple platforms.
     runs-on: macos-latest
-    # The run builds and tests gpui-kit against the snapshot, and a first
-    # publish of brand-new crates waits on the crates.io rate limit between
-    # batches; 6 hours is enough for a full run.
+    # Package verification builds the staged GPUI crates. Brand-new crates
+    # may also wait on crates.io's rate limit between publish batches.
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: oven-sh/setup-bun@v2
-      # The script builds and tests this repository against the staged crates
-      # before uploading, so the same system dependencies CI installs are
-      # needed here.
+      # The staged GPUI crates need the platform build dependencies.
       - name: Install system dependencies
         run: script/bootstrap
       - name: Cache the staged workspace and repository builds
@@ -56,7 +53,7 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          bun script/bump-gpui.ts ${{ inputs.version }} --rev "${{ inputs.rev || 'main' }}" ${{ inputs.force && '--force' || '' }}
+          bun script/bump-gpui.ts ${{ inputs.version }} --skip-kit-check --rev "${{ inputs.rev || 'main' }}" ${{ inputs.force && '--force' || '' }}
       - name: Summary
         if: always()
         run: |

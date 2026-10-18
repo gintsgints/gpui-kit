@@ -1,5 +1,9 @@
+#[cfg(feature = "gpui-fast")]
+extern crate gpui_fast as gpui;
+
 use gpui::App;
 use std::ops::Deref;
+use std::sync::LazyLock;
 
 mod component_traits;
 mod element_ext;
@@ -40,6 +44,7 @@ pub mod combobox;
 pub mod command;
 pub mod description_list;
 pub mod dialog;
+pub mod diff;
 pub mod dock;
 pub mod empty;
 pub mod form;
@@ -76,6 +81,7 @@ pub mod shimmer;
 pub mod sidebar;
 pub mod skeleton;
 pub mod slider;
+pub mod speech;
 pub mod spinner;
 pub mod status_bar;
 pub mod stepper;
@@ -94,9 +100,6 @@ pub use element_ext::*;
 pub use global_state::GlobalState;
 pub use gpui_base::Root;
 pub use gpui_base::animation;
-pub(crate) use gpui_base::measurement_enabled as measure_enable;
-#[doc(hidden)]
-pub(crate) use gpui_base::resize_handle;
 pub use gpui_base::{
     AxisExt, Edges, FocusTrapElement, InteractiveElementExt, LengthExt, Measure, OngoingScrollExt,
     Placement, Side, measure, measure_if,
@@ -109,7 +112,7 @@ pub use input::{Rope, RopeExt, RopeLines};
 pub use inspector::*;
 pub use resizable::{
     ResizablePanel, ResizablePanelEvent, ResizablePanelGroup, ResizableState, h_resizable,
-    resizable_panel, resize_handle_appearance, v_resizable,
+    resizable_panel, resize_handle, resize_handle_appearance, v_resizable,
 };
 pub use styled::*;
 pub use theme::*;
@@ -132,6 +135,7 @@ pub fn init(cx: &mut App) {
     root::init(cx);
     gpui_base::init(cx);
     input::init(cx);
+    diff::init(cx);
     date_picker::init(cx);
     dock::init(cx);
     sheet::init(cx);
@@ -154,4 +158,14 @@ pub fn locale() -> impl Deref<Target = str> {
 #[inline]
 pub fn set_locale(locale: &str) {
     rust_i18n::set_locale(locale)
+}
+
+/// Whether measurement logging is enabled, read once per process.
+///
+/// Measurement is a startup debug flag, and the table queries it for every
+/// rendered cell, so cache it instead of reading the environment each call.
+#[inline]
+pub(crate) fn measure_enable() -> bool {
+    static MEASURE_ENABLED: LazyLock<bool> = LazyLock::new(gpui_base::measurement_enabled);
+    *MEASURE_ENABLED
 }

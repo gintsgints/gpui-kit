@@ -35,6 +35,13 @@
 //! matters; but a `list` of twenty visible rows costs twenty crossings where a
 //! virtual list costs one, and that is the price of not stating heights.
 //!
+//! A `list` also calls its `get_key` around its own layout: once for the item
+//! at the top whenever that item or the render changes, and, when the item
+//! count changes, near that item's old index until its key turns up again —
+//! one or two calls when items were added or removed on one side of it only,
+//! and the whole collection once if it is gone. That is what keeps the
+//! reader's place; [`components::list`] says why it needs the key.
+//!
 //! Three things confine it, and they are worth naming because each is what
 //! stops the exception from spreading:
 //!
@@ -136,6 +143,7 @@ use gpui_base::{
 };
 
 mod components;
+mod text_view;
 
 use crate::{
     capability::is_openable_url,
@@ -336,6 +344,7 @@ struct Behavior {
     on_change: Option<CallbackId>,
     token: Option<CallbackId>,
     on_token_click: Option<CallbackId>,
+    on_token_hover: Option<CallbackId>,
     on_mouse_move: Option<CallbackId>,
     on_hover: Option<CallbackId>,
     /// Reports a key press that reached this element.
@@ -369,6 +378,8 @@ struct Behavior {
     on_mouse_down_out: Option<CallbackId>,
     /// Wheel and trackpad scrolling over this element.
     on_scroll_wheel: Option<CallbackId>,
+    /// A pinch-to-zoom gesture over this element.
+    on_pinch: Option<CallbackId>,
     /// Handlers for named actions, one entry per action listened for.
     ///
     /// A list because an element that responds to actions usually responds to
@@ -443,9 +454,15 @@ struct Behavior {
     /// the press itself. Registered on the list for the same reason
     /// `on_item_click` is.
     on_item_secondary_click: Option<CallbackId>,
+    /// Reports which items a `list` shows and how many it has, after a frame
+    /// in which either changed.
+    on_visible_range_change: Option<CallbackId>,
     /// Which item a `VirtualList` measures to infer its cross-axis size.
     /// `None` keeps base's own default, which is the first.
     item_to_measure_index: Option<usize>,
+    /// Whether a `list` follows its tail. `None` is GPUI's own default,
+    /// `FollowMode::Normal`.
+    follow_mode: Option<gpui::FollowMode>,
     /// The dock commands a chrome element carries — what base is asked to do
     /// when it is clicked or dragged.
     ///
@@ -556,6 +573,9 @@ struct Behavior {
     /// focus — the highlighted option of a combobox whose input keeps the
     /// keyboard.
     aria_active_descendant: bool,
+    /// `InteractiveElement::window_control_area`: this element is the window's
+    /// drag area or one of its caption buttons.
+    window_control_area: Option<gpui::WindowControlArea>,
 }
 
 impl Behavior {
@@ -566,6 +586,7 @@ impl Behavior {
             || !self.on_mouse_up.is_empty()
             || self.on_mouse_down_out.is_some()
             || self.on_scroll_wheel.is_some()
+            || self.on_pinch.is_some()
     }
 
     /// Whether focus or accessibility gave this element a reason to be
@@ -591,8 +612,10 @@ impl Behavior {
             || !self.on_mouse_up.is_empty()
             || self.on_mouse_down_out.is_some()
             || self.on_scroll_wheel.is_some()
+            || self.on_pinch.is_some()
             || !self.on_action.is_empty()
             || self.key_context.is_some()
+            || self.window_control_area.is_some()
     }
 }
 
@@ -1059,10 +1082,10 @@ fn materialize_component(
                 cx,
             )
         }
-        Component::TextView { id, text, format } => {
-            let mut view = match format {
-                crate::spec::TextViewFormat::Html => TextView::html(id, text),
-                crate::spec::TextViewFormat::Markdown => TextView::markdown(id, text),
+        Component::TextView(spec) => {
+            let mut view = match spec.format {
+                crate::spec::TextViewFormat::Html => TextView::html(spec.id, spec.text),
+                crate::spec::TextViewFormat::Markdown => TextView::markdown(spec.id, spec.text),
             }
             .style(TextViewStyle::from_theme(&Theme::global(cx)));
             if let Some(selectable) = behavior.selectable {
@@ -1095,7 +1118,7 @@ fn materialize_component(
                 });
             }
             Styled::style(&mut view).refine(&refinement);
-            view.into_any_element()
+            text_view::with_policy(view, spec.policy).into_any_element()
         }
         Component::Text(value) => {
             // A text run, not a `div` holding one. GPUI implements
@@ -1512,12 +1535,23 @@ fn materialize_component(
                 behavior
                     .on_token_click
                     .map(|id| crate::ComponentCallback::from_runtime(runtime, id)),
+            )
+            .with_hover(
+                &state,
+                behavior
+                    .on_token_hover
+                    .map(|id| crate::ComponentCallback::from_runtime(runtime, id)),
             );
-            let input = callbacks.apply(
-                Input::new(&state),
-                |input, render| input.token(move |token, window, cx| render(token, window, cx)),
+            let input = callbacks.apply_hover(
+                callbacks.apply(
+                    Input::new(&state),
+                    |input, render| input.token(move |token, window, cx| render(token, window, cx)),
+                    |input, listen| {
+                        input.on_token_click(move |event, window, cx| listen(event, window, cx))
+                    },
+                ),
                 |input, listen| {
-                    input.on_token_click(move |event, window, cx| listen(event, window, cx))
+                    input.on_token_hover(move |event, window, cx| listen(event, window, cx))
                 },
             );
             frame.child(input).into_any_element()
@@ -1789,6 +1823,15 @@ where
                 );
             });
         }
+        if let Some(callback) = behavior.on_pinch {
+            let runtime = Rc::downgrade(runtime);
+            let bounds = Rc::clone(&bounds);
+            element = element.on_pinch(move |event, window, cx| {
+                if let Some(runtime) = runtime.upgrade() {
+                    runtime.dispatch_pinch(callback, event, bounds.get(), window, cx);
+                }
+            });
+        }
     }
 
     // The context has to be installed before the listeners for the same reason
@@ -1933,6 +1976,7 @@ fn warn_unhonoured_input(component: &Component, behavior: &Behavior) {
         ("on_mouse_up", !behavior.on_mouse_up.is_empty()),
         ("on_mouse_down_out", behavior.on_mouse_down_out.is_some()),
         ("on_scroll_wheel", behavior.on_scroll_wheel.is_some()),
+        ("on_pinch", behavior.on_pinch.is_some()),
         ("on_action", !behavior.on_action.is_empty()),
         ("key_context", behavior.key_context.is_some()),
     ];
@@ -1991,6 +2035,42 @@ fn with_aria<E: StatefulInteractiveElement>(element: E, behavior: &Behavior) -> 
     element
 }
 
+/// Marks the element as a window control area, the way gpui-component's
+/// `TitleBar` does.
+///
+/// GPUI's `window_control_area` is a hit-test answer for the platform, and only
+/// Windows asks it. The host opens its window with an application-drawn title
+/// bar on every platform, so a drag area also moves the window itself: a left
+/// press dragged across it starts the platform move, and a double-click does
+/// what a native title bar's would — `titlebar_double_click` on macOS, a zoom on
+/// Linux. Windows keeps its native behaviour through the hit test.
+fn with_window_control<E: StatefulInteractiveElement>(element: E, behavior: &Behavior) -> E {
+    let Some(area) = behavior.window_control_area else {
+        return element;
+    };
+    let element = element.window_control_area(area);
+    if area != gpui::WindowControlArea::Drag || cfg!(target_os = "windows") {
+        return element;
+    }
+    element
+        // `on_mouse_move` reaches only the hovered element, so a move with the
+        // left button held is a press that is being dragged across this area.
+        .on_mouse_move(|event, window, _| {
+            if event.pressed_button == Some(MouseButton::Left) {
+                window.start_window_move();
+            }
+        })
+        .on_mouse_down(MouseButton::Left, |event, window, _| {
+            if event.click_count == 2 {
+                if cfg!(target_os = "macos") {
+                    window.titlebar_double_click();
+                } else {
+                    window.zoom_window();
+                }
+            }
+        })
+}
+
 /// Reports focus and accessibility calls a component cannot honour.
 ///
 /// Each bound component wires the subset base gives it a builder for; the rest
@@ -2009,6 +2089,10 @@ fn warn_unhonoured_a11y(behavior: &Behavior, component: &str, honoured: &[&str])
         ("role", behavior.role.is_some()),
         ("aria_selected", behavior.aria_selected.is_some()),
         ("aria_active_descendant", behavior.aria_active_descendant),
+        (
+            "window_control_area",
+            behavior.window_control_area.is_some(),
+        ),
     ];
     for (method, called) in asked {
         if called && !honoured.contains(&method) {
@@ -2056,6 +2140,7 @@ fn flex_element(
         && behavior.on_mouse_up.is_empty()
         && behavior.on_mouse_down_out.is_none()
         && behavior.on_scroll_wheel.is_none()
+        && behavior.on_pinch.is_none()
         && behavior.on_action.is_empty()
         && behavior.key_context.is_none()
         && !behavior.scroll_x
@@ -2077,6 +2162,7 @@ fn flex_element(
     let stateful = with_input_handlers(stateful, &behavior, runtime);
     let stateful = components::dock::with_commands(stateful, &behavior, runtime, cx);
     let stateful = with_aria(stateful, &behavior);
+    let stateful = with_window_control(stateful, &behavior);
     let mut stateful = with_active_and_focus(stateful, &states);
     if !behavior.disabled
         && let Some(callback) = behavior.on_click
@@ -2513,16 +2599,19 @@ pub(in crate::materialize) fn resolve_ops(
                 "on_mouse_up_middle" => behavior.on_mouse_up.push((MouseButton::Middle, *id)),
                 "on_mouse_down_out" => behavior.on_mouse_down_out = Some(*id),
                 "on_scroll_wheel" => behavior.on_scroll_wheel = Some(*id),
+                "on_pinch" => behavior.on_pinch = Some(*id),
                 "on_resize" => behavior.on_resize = Some(*id),
                 "on_change" => behavior.on_change = Some(*id),
                 "token" => behavior.token = Some(*id),
                 "on_token_click" => behavior.on_token_click = Some(*id),
+                "on_token_hover" => behavior.on_token_hover = Some(*id),
                 "on_step" => behavior.on_step = Some(*id),
                 "on_open_change" => behavior.on_open_change = Some(*id),
                 "on_confirm" => behavior.on_confirm = Some(*id),
                 "on_dismiss" => behavior.on_dismiss = Some(*id),
                 "on_item_click" => behavior.on_item_click = Some(*id),
                 "on_item_secondary_click" => behavior.on_item_secondary_click = Some(*id),
+                "on_visible_range_change" => behavior.on_visible_range_change = Some(*id),
                 "tab_bar" => behavior.dock_chrome.tab_bar = Some(*id),
                 "empty_group" => behavior.dock_chrome.empty_group = Some(*id),
                 "drop_indicator" => behavior.dock_chrome.drop_indicator = Some(*id),
@@ -3097,6 +3186,16 @@ fn apply_behavior(behavior: &mut Behavior, name: &str, args: &[Bridged]) {
                 .filter(|index| *index >= 0.0 && index.fract() == 0.0)
                 .map(|index| index as usize);
         }
+        "with_follow_mode" => {
+            behavior.follow_mode =
+                args.first()
+                    .and_then(|value| value.as_str().ok())
+                    .and_then(|mode| match mode {
+                        "normal" => Some(gpui::FollowMode::Normal),
+                        "tail" => Some(gpui::FollowMode::Tail),
+                        _ => None,
+                    });
+        }
         "track_focus" => {
             behavior.focus_handle = match args.first() {
                 Some(Bridged::Number(handle)) if *handle >= 0.0 && handle.fract() == 0.0 => {
@@ -3128,6 +3227,21 @@ fn apply_behavior(behavior: &mut Behavior, name: &str, args: &[Bridged]) {
         }
         "aria_selected" => behavior.aria_selected = Some(flag.unwrap_or(true)),
         "aria_active_descendant" => behavior.aria_active_descendant = true,
+        "window_control_area" => {
+            behavior.window_control_area = match args.first().and_then(|value| value.as_str().ok())
+            {
+                Some("drag") => Some(gpui::WindowControlArea::Drag),
+                Some("close") => Some(gpui::WindowControlArea::Close),
+                Some("max") => Some(gpui::WindowControlArea::Max),
+                Some("min") => Some(gpui::WindowControlArea::Min),
+                other => {
+                    tracing::error!(
+                        "`window_control_area` takes \"drag\", \"close\", \"max\" or \"min\", not {other:?}; the area is dropped"
+                    );
+                    None
+                }
+            };
+        }
         "row_count" => behavior.row_count = whole_count(args),
         "column_count" => behavior.column_count = whole_count(args),
         "open" => behavior.open = Some(flag.unwrap_or(true)),

@@ -7,9 +7,9 @@ description: Renders Markdown and HTML text with optional custom Markdown plugin
 
 `TextView` renders formatted text in GPUI. It supports Markdown and simple HTML, text selection, code block actions, and custom Markdown plugins for project-specific syntax.
 
-The canonical implementation now lives in `gpui-base`; this module remains a compatibility re-export and provides component-theme adaptation. Base-only setup, complete default styling, and opt-in syntax highlighting are documented on [GPUI Base TextView](/base/text-view).
+The canonical implementation now lives in `gpui-base`; this module remains a compatibility re-export and provides component-theme adaptation. Base-only setup, complete default styling, and opt-in syntax highlighting are documented on [GPUI Base TextView](../base/text-view.md).
 
-TextView is selectable by default and uses the shared window selection engine from `gpui-base`. Use `.selectable(false)` only when selection must be disabled. See [GPUI Base Text Selection](/base/text-selection) when integrating plain text or a custom renderer with the same selection.
+TextView is selectable by default and uses the shared window selection engine from `gpui-base`. Use `.selectable(false)` only when selection must be disabled. See [GPUI Base Text Selection](../base/text-selection.md) when integrating plain text or a custom renderer with the same selection.
 
 ## Import
 
@@ -42,6 +42,18 @@ TextView::markdown("preview", markdown_source)
 
 ```rust
 TextView::html("html-preview", "<strong>Hello</strong>")
+```
+
+### Inside a colored surface
+
+A `TextView` without an explicit `.style()` follows the text color of its
+container. On a surface that is inverted from the page, such as a `Filled`
+[Bubble](bubble.md), links, muted text, code and table backgrounds, borders and
+selection are derived from that color as well, and syntax highlighting is left
+out, so the content needs no extra styling:
+
+```rust
+Bubble::new().child(TextView::markdown("reply", text))
 ```
 
 ### Clamp to a number of lines
@@ -93,7 +105,171 @@ reduced motion. Nothing animates unless the view opts in.
 
 Pass a `TextViewMotion` through `.motion(...)` to choose the duration or
 easing yourself, or to reveal each chunk word by word; see
-[GPUI Base TextView](/base/text-view#retained-state-and-streaming-updates).
+[GPUI Base TextView](../base/text-view.md#retained-state-and-streaming-updates).
+
+### Highlight ranges
+
+An application that searches a document, or points at a citation inside it,
+paints its ranges with `set_range_highlights`. The application owns the
+search: it finds its ranges in `rendered_text()`, the text the view shows, and
+hands them back with the colors to paint them in, a stronger one for the
+current result:
+
+```rust
+use gpui_kit::component::{
+    ActiveTheme as _,
+    text::{RangeHighlight, RangeHighlightError, TextViewState},
+};
+
+fn highlight_matches(
+    state: &mut TextViewState,
+    query: &str,
+    current_match: usize,
+    cx: &mut Context<TextViewState>,
+) -> Result<(), RangeHighlightError> {
+    let (color, current_color) = (cx.theme().warning.opacity(0.3), cx.theme().warning);
+    let text = state.rendered_text();
+    let matches = if query.is_empty() {
+        Vec::new()
+    } else {
+        text.as_str().match_indices(query).collect()
+    };
+    let highlights = matches.into_iter().enumerate().map(|(ix, (start, found))| {
+        RangeHighlight::new(
+            start..start + found.len(),
+            if ix == current_match { current_color } else { color },
+        )
+    });
+    state.set_range_highlights(highlights, cx)
+}
+```
+
+`rendered_text()` is the text plain copy produces: `hello **world**` reads
+`hello world`, escapes are resolved, and heading and list markers are left
+out. Offsets are UTF-8 byte offsets, so the ranges `str` search returns can be
+passed as they are, and a repeated phrase is addressed by where it occurs. The
+text is built the first time it is read.
+
+A highlight is painted behind the text and under the selection, so wrapping,
+alignment, syntax colors, links, selection and copy stay as they were. Where
+highlights overlap, the later one paints over the earlier. A range that
+crosses from one block into the next paints in both. Text that belongs to no
+block is left unpainted: the line breaks between blocks, the spaces between
+table cells, custom blocks, HTML blocks and inline plugin objects. Only a range
+that is reversed, out of bounds or not on a character boundary is rejected,
+and the whole set with it.
+
+When the content changes, a highlight follows its block and stays as far as
+the block's text is unchanged. Text appended while streaming, through
+`push_str` or `set_text`, keeps the highlights before it, and an edit keeps
+those before and after it. After an edit inside a table, the cells in and
+after the edited row lose theirs, since a cell is only known by its place in
+the table. The view notifies when its text changes: observe the state and
+search the new `rendered_text()` again. Compute ranges and call
+`set_range_highlights` in the same state update so the ranges address the
+current text. Backgrounds that are part of the text, such as
+`<mark>` and syntax highlighting, paint over a range highlight (inline code's
+background is painted under it), and highlights do not fade in with streamed
+text. HTML views do not support range highlights.
+
+An application that keeps ranges of the Markdown source instead, such as the
+ranges `selected_source_range()` returns for the passages people comment on,
+converts each with `range_for_source` on the same `rendered_text()`:
+
+```rust
+use std::ops::Range;
+
+use gpui_kit::component::{
+    ActiveTheme as _,
+    text::{RangeHighlight, RangeHighlightError, TextViewState},
+};
+
+fn highlight_comments(
+    state: &mut TextViewState,
+    markdown: &str,
+    comments: &[Range<usize>],
+    cx: &mut Context<TextViewState>,
+) -> Result<(), RangeHighlightError> {
+    let text = state.rendered_text();
+    // The ranges index `markdown`. Until its parse lands, the view renders the
+    // source it had before; convert again when the view notifies.
+    if text.source() != markdown {
+        return Ok(());
+    }
+    let color = cx.theme().info.opacity(0.3);
+    let highlights = comments
+        .iter()
+        .filter_map(|comment| text.range_for_source(comment.clone()))
+        .map(|range| RangeHighlight::new(range, color));
+    state.set_range_highlights(highlights, cx)
+}
+```
+
+`range_for_source` returns the smallest range holding every character
+rendered from the source range. Source that renders nothing, such as emphasis
+delimiters, heading and list markers, code fences, table pipes and link
+destinations, adds nothing, so `**bold**` and `bold` convert to the same range.
+A character is included when any of its source is in the range: `&` for part
+of `&amp;`, or the whole text of an inline plugin object for part of its
+source. Converting the source range a selection reports gives the selected
+range back, except that a line break between blocks at either end of the
+selection is rendered from no source and is left out: Select All gives back
+everything but the line break after the last block.
+
+`rendered_text().source()` is the source of the last parse that landed. While
+text is appended with `push_str`, it is a prefix of the text the view was
+given; after `set_text` replaces the content, it can be the earlier, unrelated
+text until the new parse lands, so compare it with the source your ranges
+index, as the example does, before converting. The result is
+`None` when the range is empty, out of bounds or not on a character boundary,
+when nothing is rendered from it, and always in HTML views.
+
+### Scroll to a range
+
+`reveal_range` scrolls to a range of the same text, such as the current
+result when the user steps to the next one:
+
+```rust
+state.reveal_range(current_range, cx)?;
+```
+
+It scrolls the line the range starts on into view, down to a line in the
+middle of a long paragraph, and leaves the view where it is when that line, or
+a whole block revealed, is already visible. An empty range reveals the line of
+its position. A `scrollable` view scrolls itself. A fit-content view scrolls
+the nearest enclosing `gpui::list`, as a chat transcript is, as long as the
+row that holds the view is laid out: scroll to that row first when it may be
+off screen. Any other scroll container, such as a `div` with
+`overflow_y_scroll`, scrolls through `on_reveal`, which receives the line's
+bounds in window coordinates:
+
+```rust
+let scroll = scroll_handle.clone();
+TextView::new(&state).on_reveal(move |line, _, _| {
+    let viewport = scroll.bounds();
+    let mut offset = scroll.offset();
+    if line.bottom() > viewport.bottom() {
+        offset.y -= line.bottom() - viewport.bottom();
+    } else if line.top() < viewport.top() {
+        offset.y += viewport.top() - line.top();
+    }
+    scroll.set_offset(offset);
+})
+```
+
+A range that covers no block's text, such as a custom block's, scrolls its
+whole block into a scrollable view. Only the latest reveal is carried out. It
+follows the content the way highlights do, and it is dropped when its text
+changes, when the view clamps its lines with `max_lines`, or when it cannot be
+shown within a second, so it never scrolls long after it was asked for. Text
+scrolled sideways inside a table stays where it is, a block revealed whole and
+taller than the view shows its end when it comes from below, a scrollable
+view inside an application list scrolls only itself, and views sharing one
+state share one reveal.
+
+Revealing is best effort. `Ok(())` means the range is valid for the current
+text and the request was taken, not that the view has scrolled, and a dropped
+request is not reported.
 
 ## Touch Selection
 
@@ -103,7 +279,7 @@ following the finger while it stays down. Lifting it opens an edit menu with
 Dragging a handle moves that end while the other stays put; `Select All`
 selects the view that was pressed, and its handles keep working on the result.
 
-The handles and the menu are drawn by [`Root`](/component/root) for the whole
+The handles and the menu are drawn by [`Root`](./root.md) for the whole
 window selection, so they cover a selection that spans several views. A tap
 elsewhere clears them, and the menu steps aside while the content scrolls
 under a finger.

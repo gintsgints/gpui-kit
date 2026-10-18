@@ -75,6 +75,19 @@ TextView::markdown("themed", source).style(style)
 
 `TextViewStyle::from_theme(&theme)` 可读取 `gpui_kit::base::Theme` 的语义颜色。使用上层组件主题时，可调用 `gpui_kit::component::text::text_view_style(cx.theme())`。
 
+没有显式设置 `.style()` 的 TextView 可以跟随容器设置的文字颜色，这样放在聊天气泡这类有填充底色的容器里也能看清。在应用默认值里开启：
+
+```rust
+use gpui_kit::base::{TextViewDefaults, TextViewStyle};
+
+TextViewDefaults::new()
+    .with_style(TextViewStyle::default())
+    .with_inherit_text_color(true)
+    .install(cx);
+```
+
+正文使用继承来的颜色。如果这个颜色和样式的正文颜色在明度上相差很大，说明底色与页面明暗相反，此时链接、次要文字、代码和表格背景、边框、选择色也都从它推算，并且不再使用已安装的语法高亮。只有在每个窗口的根部都设置了文字颜色时才开启；GPUI Component 的 Root 会设置，Component 也默认开启了这一项。
+
 ## 语法高亮由使用者开启
 
 `gpui-base` 默认不启用语法高亮，也不包含 tree-sitter 语言依赖。应用未提供 `code_block_highlighter` 时，围栏代码块只使用中性的代码背景和普通前景色。
@@ -218,6 +231,8 @@ TextView::new(&document).motion(
 
 不设错位时每次更新整块一起淡入。设了错位时，追加的文字按词拆分（词带上其后的空白），中日韩文字按字拆分；一次追加很长时会压缩错位，保证最后一个词在一个淡入时长内开始。追踪器比较的是渲染后的文字而不是源码字节，因此 `set_text` 传入以当前文本为前缀的更长文本会被视为追加；流式过程中被补齐的 Markdown 标记（`**bo` 变成粗体 `bold`）只让发生变化的字形重新淡入，不会整段闪烁。每次只比较更新触及的块，并且只在还有文字在淡入时才请求下一帧。系统开启减少动态效果时跳过淡入。
 
+`TextViewState::set_range_highlights` 在 `rendered_text()`（与纯文本复制得到的文字一致）的指定范围后面绘制背景，应用可以借此显示搜索结果或引用位置，无需重新解析或修改文档样式。这些范围只参与绘制、不参与排版，因此不会改变布局。Markdown 源码里的范围（例如 `selected_source_range()` 返回的范围）可以用 `rendered_text().range_for_source(range)` 转换过来。`reveal_range` 通过视图自身的列表、外层 `gpui::list`，或者其他容器上的 `TextView::on_reveal`，把范围起点所在的行滚动到可见区域内；规则详见[高亮文本范围](../component/text-view.md#高亮文本范围)和[滚动到范围](../component/text-view.md#滚动到范围)。
+
 通过 `SelectionFormat` 可以选择复制渲染文本或 Markdown 源码。链接路由、代码块操作、表格操作、图片和 Markdown 插件继续使用与兼容 API 相同的 builder，详见 [gpui-component TextView 文档](../component/text-view.md)。
 
 ## 可运行源码
@@ -229,3 +244,21 @@ TextView::new(&document).motion(
 ```bash
 cargo run -p gpui-base-examples -- text-view
 ```
+
+## 显示变化后的选区保持
+
+样式、语法高亮、继承字体或宽度变化时，已完成的选区默认保持相同的逻辑文本范围和复制内容，同时应用新的显示样式和换行布局。移动已挂载的视图不会用旧的鼠标矩形重新计算选区。新的选择操作或显式清除会正常更新选区；替换原文或 Markdown 解析配置仍会清除选区。拥有视图的代码必须保持状态和选择参与者挂载；这个行为不会固定外层虚拟列表中已卸载的行。
+
+
+## 构建外部富文本组件
+
+`gpui_kit::base::text::editor_host` 对外提供 TextView 的渲染能力，外部组件可以保留自己的编辑模型。将文档投影为 `BlockNode`，由组件管理命令、历史记录、选区、焦点和原生输入。
+
+- 通过 `Paragraph::with_leaf_key` 或 `CodeBlock::with_leaf_key` 标记叶节点。同一收集范围内的 key 必须唯一。克隆最初共享运行时状态；为克隆设置 key 时，会将其叶节点状态与原节点分离。
+- 使用 `RenderContext::new(style)` 设置局部样式，或使用 `from_app(cx)` 读取 TextView 默认值。通过 `with_code_block_highlighter`、`with_image_source`、`on_link_click` 和 `with_link_reference` 局部配置高亮、图片来源、链接操作及引用链接。
+- 使用 `render_with_id` 渲染块，并传入稳定的业务 ID。叶节点的几何 key 与 GPUI element ID 分别承担不同职责。
+- 在自定义 element 的 prepaint 阶段调用 `collect_leaf_geometry(decorations, || child.prepaint(window, cx))`。它只返回当前范围内执行过 prepaint 的叶节点，嵌套范围相互隔离。
+- 内容、字体、宽度或滚动位置变化后，应替换几何结果。`LeafGeometry` 是不可变快照，坐标使用窗口逻辑像素；索引使用 UTF-8 字节，每个行内原子节点以 U+FFFC 表示，占三个字节。
+- Decoration 使用有序的半开区间。文本背景绘制在字形下方；原子节点的 decoration 覆盖整个节点并绘制在内容上方。原子节点的选区颜色应使用半透明色。
+
+这个 API 复用 TextView 的水平块流渲染器。宿主仍需管理原生输入的 UTF-16 转换、无障碍集成和虚拟化。当前的字节索引几何无法表达双向文本中的光标 affinity，也无法区分软换行边界的两侧，因此还不是完整的视觉光标导航 API。

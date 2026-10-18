@@ -1,7 +1,7 @@
 ---
-title: 测试
+title: Testing
 description: 通过 Rust 单元测试、TestAppContext、真实 UI 交互和布局断言测试 GPUI Kit 应用与 GPUI 行为。
-order: -11
+order: -3.39
 example: false
 ---
 
@@ -10,8 +10,8 @@ example: false
 本指南统一介绍 GPUI Kit 应用和 GPUI 的测试方式。根据要验证的行为选择测试层级：
 
 - 纯数据转换、校验和状态转换使用普通 Rust `#[test]`。
-- Entity、action、订阅和异步任务使用 `#[gpui_kit::test]` 与 `TestAppContext`，按需创建窗口。
-- UI 集成测试渲染真实应用视图，通过 `gpui_kit::test` 派发事件，再检查控件状态、布局和业务结果。
+- [Entity](./entity)、[Action](./action)、[订阅](./event)和异步 [Task](./task) 使用 `#[gpui_kit::test]` 与 `TestAppContext`，按需创建窗口。
+- UI 集成测试渲染真实应用视图，通过 `gpui_kit::test` 派发[事件](./event)，再检查控件状态、布局和业务结果。
 - 像素检查使用独立的离屏渲染器；原生窗口和平台集成保留相应测试。
 
 类型和 `#[gpui_kit::test]` 均由 Kit 根模块提供，应用无需再添加 GPUI 依赖。测试模块应显式导入用到的类型：`use gpui_kit::*;` 也会引入 GPUI 的 `test` 宏，可能遮蔽 Rust 原生的 `#[test]`。下方完整示例使用显式导入。
@@ -31,7 +31,7 @@ use gpui_kit::test::TestWindowExt;
 ```
 
 当行为涉及组件之间的协作，例如输入内容、保存对话框、检查父视图中的结果，
-就适合使用 UI 集成测试。测试通过 `ElementId` 定位控件，派发真实 GPUI 事件，
+就适合使用 UI 集成测试。测试通过 [`ElementId`](./element_id) 定位控件，派发真实 GPUI 事件，
 再用普通 Rust 断言检查结果。
 
 本指南介绍进程内的行为与布局自动化。元素快照不会检查像素，也不会启动打包后的应用。像素验证使用下文单独介绍的 GPUI 离屏渲染器。如果需要验证原生窗口、平台集成或视觉效果，应另外保留相应测试。
@@ -48,6 +48,7 @@ workspace/
   ui-tests/
     Cargo.toml
     tests/ui.rs
+    tests/common/mod.rs
 ```
 
 在 `ui-tests/Cargo.toml` 中写入：
@@ -67,22 +68,25 @@ gpui-kit = { path = "../gpui-kit/crates/kit", features = ["test-support"] }
 
 ## 一个完整测试
 
-把下面代码复制到 `tests/ui.rs`。示例使用 GPUI Kit 的统一入口，初始化组件库，用 `Root` 包装视图，并像真实应用一样将输入状态保存在视图上。
+下面直接引用仓库中会参与编译的 `tests/ui.rs`。它初始化组件库，并像真实应用一样将输入状态保存在视图上。其中 `mod common;` 会加载配套的
+`tests/common/mod.rs` fixture。这个辅助文件以明确的 640 × 480 窗口尺寸调用公开的
+`gpui_kit::open_window`，由该函数用 `gpui_kit::base::Root` 包装视图，并返回窗口句柄与视图 entity。它只是测试准备代码，不是额外的库依赖。
 
-测试会输入 Unicode 姓名，通过 Backspace 编辑，点击 Save，检查状态文本与布局，最后验证保存的业务值。以下代码直接引用仓库集成测试的源码，会实际编译运行。
+测试会输入 Unicode 姓名，通过 Backspace 编辑，点击 Save，检查状态节点的 AccessKit 角色、名称与布局，最后验证保存的业务值。测试并不能验证屏幕阅读器是否实际播报。以下代码直接引用仓库集成测试的源码，会实际编译运行。
 
 <<< ../../../crates/kit/tests/ui.rs{rust}
 
-在自己的应用中，应从 library crate 导入生产视图及其构造函数。不要在测试中另写一份视图实现，否则测试与应用可能逐渐不一致。本例内联定义视图，是为了让整个示例可以直接复制到新项目。
-
-在 `ui-tests/` 中运行：
+独立项目必须复制**两个**文件；只复制 `ui.rs` 会在 `mod common;` 处失败。在上述布局的 `ui-tests/` 目录运行：
 
 ```sh
+mkdir -p tests/common
+cp ../gpui-kit/crates/kit/tests/ui.rs tests/ui.rs
+cp ../gpui-kit/crates/kit/tests/common/mod.rs tests/common/mod.rs
 cargo generate-lockfile
 cargo test --test ui --locked
 ```
 
-将 `Cargo.lock` 一起提交。在 GPUI Kit 源码目录中，可以直接运行同一个示例：
+将 `Cargo.lock` 一起提交。在自己的应用中，应从 library crate 导入生产视图及其构造函数，替换示例中的 `Profile`，继续沿用窗口设置与交互写法。另写一份测试视图容易与应用实现脱节。在 GPUI Kit 源码目录中，可以直接运行同一个测试：
 
 ```sh
 cargo test -p gpui-kit --features test-support --test ui --locked
@@ -113,6 +117,8 @@ cargo test -p gpui-kit --features test-support --test ui --locked
 | Dialog / Sheet | 宿主焦点作用域与内容表面边界；子控件保留各自属性 |
 | Menu | 菜单项名称与选中状态、菜单焦点作用域、子菜单边界 |
 | Notification | Alert 角色与边界；关闭按钮沿用 Button 观察 |
+| Progress / ProgressCircle | 进度指示器角色与名称；`ElementSnapshot::value()` 不读取数值型无障碍属性 |
+| TitleBar | `title-bar` 与 `window-controls` 边界；窗口控制按钮（`minimize`、`maximize` 或 `restore`、`close`）仅在标题栏自行绘制时可读 |
 | Dock | 区域、分组与内容边界及焦点作用域；Tab 保留原生选中状态 |
 
 优先使用构造函数 ID。Input 和 Select 支持 `.id("name")`，默认 ID 包含状态 entity ID。
@@ -178,24 +184,34 @@ assert!(save.visible());
 
 ## 操作与断言
 
-导入 `gpui_kit::test::TestWindowExt` 后使用以下方法：
+从 `gpui_kit::test` 导入 `TestWindowExt` 使用查询和交互方法：
 
 | API | 行为 |
 | --- | --- |
 | `window.find(id)` | 严格返回最近完成帧的 `ElementSnapshot`；缺失时 panic，列出注册路径与排查提示。 |
 | `window.try_find(id)` | 缺失时返回 `None`，歧义仍会 panic。 |
+| `window.find_all(id)` | 按当前帧边界原点的 y、x 排序，返回所有已注册匹配项，包括不可见元素；同坐标顺序不保证，缺失时返回空 `Vec`。 |
 | `window.click(id, cx)` | 在中心发送原生鼠标移动、按下与释放。 |
 | `window.click_at(id, offset, cx)` | 相对于目标左上角的像素偏移点击，适合部分裁剪。 |
+| `window.click_with_modifiers(id, modifiers, cx)` | 携带修饰键在中心左键点击；发送修饰键变化事件，结束后恢复之前的修饰键状态。 |
+| `window.click_with_options(id, options, cx)` | 用 `ClickOptions` 组合偏移、鼠标键、点击次数和修饰键；结束后恢复之前的修饰键状态。 |
 | `window.right_click(id, cx)` / `double_click(id, cx)` | 原生右键或两次点击序列。 |
 | `window.hover(id, cx)` | 移动指针，不按键。 |
 | `window.scroll(id, delta, cx)` | 原生滚轮事件，`ScrollDelta` 保留 GPUI 的方向与单位。 |
 | `window.drag_to(from_id, to_id, cx)` | 定位两个目标，在其中心之间通过真实命中测试拖拽。 |
 | `window.drag(from, to, cx)` | 窗口坐标之间的左键拖拽，经过真实拖拽创建与放置命中测试。 |
-| `window.press("backspace", cx)` | 使用 GPUI 按键解析器发送特殊键或快捷键。 |
+| `window.press("backspace", cx)` | 使用 GPUI 按键解析器，为特殊键或快捷键发送原生 key-down/key-up 事件。 |
 | `window.input(text, cx)` | 向当前焦点逐字符输入，不自动聚焦或替换整个值。 |
 
-作用域支持 `find`、`try_find`、嵌套 `within`、`click`、`click_at`、`right_click`、
-`double_click`、`hover`、`scroll`、`drag_to`、`press` 和 `input`。
+`ClickOptions::new()` 默认在中心单击左键，不带修饰键。例如，
+`ClickOptions::new().with_offset(point(px(8.), px(8.)))
+.with_button(MouseButton::Right).with_count(2).with_modifiers(Modifiers::shift())`
+组合局部偏移、右键双击和 Shift。点击次数必须大于零，可配置点击保留 Caps Lock 状态。
+`find_all` 的顺序只表示当前帧几何位置，不表示稳定身份、绘制顺序或业务顺序；
+统计可见匹配项时，用 `visible()` 过滤。
+
+作用域支持 `find`、`try_find`、`find_all`、嵌套 `within`、`click`、`click_at`、
+`click_with_modifiers`、`click_with_options`、`right_click`、`double_click`、`hover`、`scroll`、`drag_to`、`press` 和 `input`。
 `drag_to` 的两个 ID 都在当前作用域中解析。跨作用域拖拽或指定偏移时，可查询目标后
 将窗口坐标传给 `window.drag`。
 
@@ -226,13 +242,47 @@ dialog.hover("help", cx);
 ```rust
 let before = window.find("agree");
 window.click("agree", cx);
-assert_eq!(before.checked(), Some(false)); // 原来的帧。
-assert_eq!(window.find("agree").checked(), Some(true)); // 新的一帧。
+assert_eq!(before.checked(), Some(false)); // Previous frame.
+assert_eq!(window.find("agree").checked(), Some(true)); // New frame.
 ```
 
 同时断言界面状态与业务结果。验证保存的模型或发出的事件也是集成测试的一部分，
-但不能取代相关控件可见状态的验证。文本输入不模拟完整的系统 IME 组合输入；
+但不能取代相关控件可见状态的验证。包括 Enter 在内的命令按键不应通过 IME 回调注入换行文字。
+文本输入不模拟完整的系统 IME 组合输入；
 密码输入框不报告值，需要时通过应用状态验证结果。
+
+## 通过输入处理器验证文字组合
+
+`gpui_kit::test::TestInput` 将显式传入的 GPUI `InputHandler` 与窗口连接起来。
+如果 entity 实现了 `EntityInputHandler`，先用
+`gpui_kit::ElementInputHandler::new(bounds, entity.clone())` 创建适配器，再传给
+`TestInput::new(handler, window)`。entity 应由生产视图持有，bounds 使用
+真实输入区域。这个桥接器直接调用指定处理器，不会选择当前焦点控件，也不运行系统 IME。
+
+`commit_text(text, cx)` 通过 `replace_text_in_range` 提交文字；
+`compose_text(replacement, text, selection, cx)` 通过
+`replace_and_mark_text_in_range` 更新组合文字。替换范围和选区使用 UTF-16 code unit，
+不是 UTF-8 字节偏移；选区相对于组合文字。替换范围为 `None` 时，处理器替换现有的
+标记范围或选区。空的组合文字按处理器协议取消预编辑。
+`marked_text_range(cx)` 返回文档中的标记范围；`selected_text_range(cx)` 返回
+`Option<UTF16Selection>`，包含选区方向。`unmark_text(cx)` 结束标记并保留文字。修改方法调用处理器后完成一帧，可验证组合状态变化与提交行为。系统候选窗口、
+焦点路由和系统 IME 集成仍需原生测试。向当前焦点输入普通文字时使用 `window.input`。
+
+## 窗口尺寸、显示缩放与剪贴板
+
+在窗口 update 外调用 GPUI 已有的
+`TestAppContext::simulate_window_resize(handle, size)` 和
+`simulate_window_scale_factor_change(handle, scale)`，再用 `render_frame`
+刷新布局。不同显示缩放下，鼠标坐标仍使用窗口内的逻辑像素。应同时检查编辑状态是否
+保留、布局是否调整，并在新位置激活控件。
+
+用生产快捷键（`secondary-c`、`secondary-x`、`secondary-v`）验证剪贴板操作，
+需要时通过 `cx.read_from_clipboard()` 检查内容。测试平台在窗口之间共享剪贴板，
+编辑器状态则应互相独立。这些测试验证测试平台适配器与应用快捷键，不验证系统剪贴板服务。
+
+激活外部 Link 后，可以用 `cx.opened_url()` 检查测试平台收到的 URL，
+同时验证应用的点击回调。它不代表浏览器已打开目标页面。测试平台未公开鼠标指针
+样式的读取 API；不能根据 URL 或回调断言指针样式。
 
 ## 查询前完成一帧
 
@@ -277,6 +327,41 @@ GPUI `dispatch_action` 会排队执行。继续修改 action 将读取的值之�
 Sheet/Notification 几何测试会等待真实入场时长，再断言最终边界。
 Base motion 则可以响应公开的 `cx.set_reduce_motion(true)` 偏好，用于测试展开后的最终几何。
 
+## 按无障碍属性查询与分步事件
+
+导入 `gpui_kit::test::{TestQueryExt, TestEventExt}`，可使用更多查询与事件操作。
+`elements()` 返回当前帧中已观测的元素；`find_by_label(label)`、
+`try_find_by_label(label)` 和 `find_all_by_label(label)` 精确匹配原生无障碍标签，区分大小写；
+`find_all_by_role(role)` 按 AccessKit `Role` 查询。结果包括不可见的注册元素，
+先按 y、再按 x 排序，同位置按路径区分。必需查询缺少目标时 panic；唯一目标查询
+遇到歧义也会 panic。作用域查询只包含后代，不包含作用域节点自身。这些方法也支持 `within`
+作用域，不会发现未观测的文字或尚未绘制的虚拟行。标签是无障碍名称，不是屏幕文字；
+名称会随本地化变化时，优先使用稳定 ID。
+锁定版本的 GPUI 不提供匿名绘制文本的枚举。因此 Kit 没有通用的绘制文本
+`HasText` 断言；精确匹配无障碍标签不能证明文字已经实际绘制。
+
+需要检查手势中间状态时，可分别发送事件：
+
+```rust
+use gpui_kit::test::TestEventExt;
+
+let start = window.find("handle").bounds().center();
+window.pointer_down(start, MouseButton::Left, cx);
+window.pointer_move(start + point(px(24.), px(0.)), Some(MouseButton::Left), cx);
+// 在鼠标按住期间检查状态。
+window.pointer_up(start + point(px(24.), px(0.)), MouseButton::Left, cx);
+```
+
+坐标使用窗口内的像素位置。`pointer_move(position, pressed_button, cx)`
+需要显式指定按住的按钮；这些方法不保存按钮状态。`pointer_down` 与 `pointer_up`
+各发送一次点击事件。普通点击、悬停、滚动、拖动和分步鼠标事件使用窗口当前的修饰键；
+配置式点击临时使用指定修饰键，结束后恢复之前的状态。`change_modifiers(modifiers, cx)`
+修改修饰键并保留 caps lock，手势结束后应恢复之前的修饰键。
+`key_down(key, is_held, cx)` 与 `key_up(key, cx)` 支持分别发送按下、松开和自动重复
+事件（`is_held = true`）。键盘事件合并按键字符串中的修饰键与窗口已按住的修饰键，
+不修改窗口保存的修饰键状态。每一步先刷新，再发送事件并完成一帧。这些键盘事件不插入
+文字；输入文字使用 `input`。延迟结果仍需离开窗口 update 后等待。
+
 ## 覆盖范围与失败排查
 
 仓库通过真实输入、原生属性和布局边界验证以下组件流程。这些是具体的回归契约，
@@ -285,17 +370,50 @@ Base motion 则可以响应公开的 `cx.set_reduce_motion(true)` 偏好，用�
 | 测试文件 | 验证行为 |
 | --- | --- |
 | `test_macro.rs` | 普通 `#[test]` 与同步/异步 `#[gpui_kit::test]` 共存；独立、仅依赖 Kit 的 recipes 包复用相同契约 |
+| `input.rs` 与 `input/` | Input、Textarea、Editor 的编辑、剪贴板、选区、历史记录、只读切换、Unicode、多行视口、搜索替换、补全确认，以及重绘后的状态保留 |
+| `input_focus.rs` | 带静态前后缀的输入框反复 Tab/Shift-Tab 遍历、前后缀按钮的焦点与激活，以及点击 Textarea/Editor 正文后的焦点和编辑 |
 | `search.rs` | Command 禁用项跳过、循环导航、中文关键词、空结果、Action 与原始索引回调、两阶段 Escape；Combobox 搜索、单选/多选、清除、空结果恢复、禁用行为及关闭时仅一次 Confirm |
 | `disclosure.rs` | Accordion 互斥展开、折叠与实际面板几何；Stepper 内容导航；禁用展开与步骤操作；Slider 轨道点击、滑块拖动与禁用行为 |
 | `collections.rs` | Tree 点击展开、键盘展开/折叠与选择；DataTable 行选择、键盘虚拟滚动与滚轮滚动 |
+| `query_helpers.rs` | 精确无障碍标签和角色、作用域歧义、不可见注册元素与不可变快照 |
+| `event_helpers.rs` | 分步鼠标和按键事件、自动重复与保持修饰键 |
+| `control_steps.rs` | Button 移出释放取消、Checkbox 按键重复及 Switch 在按键释放前禁用 |
+| `slider_steps.rs` | 滑轨与拖动中的实时值变化、释放事件顺序及禁用时的手势 |
+| `semantic_controls.rs` | RadioGroup 作用域内的无障碍名称、受控状态及单项和整组禁用 |
+| `collection_steps.rs` | List 释放时的修饰键、移出取消、重复导航与确认 |
+| `composition_helpers.rs` | 显式输入处理器桥接、UTF-16 预编辑、整段提交、取消及多行 Textarea/Editor 的撤销和 readonly 切换 |
+| `environment.rs` | 窗口尺寸和显示缩放、跨窗口剪贴板、Link URL 请求与应用回调 |
 | `date_picker.rs` | 打开、精确预设日期与日历日期选择、月份切换、清除、Escape 与禁用行为 |
 | `overlays.rs` | Dialog 校验 → 作用域 Input → 保存 → Notification；悬停显示关闭按钮；自动关闭计时；Dialog/Sheet Escape 与焦点恢复；表面边界 |
-| `menu.rs` | 禁用菜单项、键盘确认、Escape、焦点恢复、子菜单悬停及嵌套菜单项激活 |
+| `menu.rs` | 禁用菜单项、键盘确认、Escape、焦点恢复、子菜单悬停、嵌套菜单项激活及最内层右键菜单的事件归属 |
 | `dock.rs` | Tab 选择与重排、跨分组拖放、放大和恢复分割布局 |
 
 已有表单、Select、HoverCard、虚拟列表、指针、生命周期和隔离测试继续保留。
 纯展示组件通过几何或像素断言验证，不虚构交互状态。自定义部件观察已有原生元素；
 不支持的属性保持不可用，不提供手填测试值的覆盖入口。
+
+[Input 回归测试范例](https://github.com/longbridge/gpui-kit/tree/main/crates/kit/tests/input)
+展示了如何把手工编辑步骤变成可重复的 UI 测试。在仓库根目录运行编辑和焦点两个目标，
+或选择单个流程：
+
+```sh
+script/test-input # 完整回归入口：Base、Component 和 Kit（使用 Bash）
+cargo test -p gpui-kit --features test-support --test integration --locked -- input:: input_focus::
+cargo test -p gpui-kit --features test-support --test integration --locked -- input::history::paste_is_atomic_and_separate_from_surrounding_typing --exact
+cargo test -p gpui-kit --features test-support --test integration --locked -- input_focus::reverse_tab_cycles_three_inputs_with_passive_addons --exact
+```
+
+在合并运行命令后追加 `-- --list`，可列出用例而不执行。
+这些命令用于复现，不代表已有通过记录。报告运行结果时，请注明代码版本、平台、命令和实际结果。
+
+示例流程包括输入 → 粘贴 → 输入 → Undo/Redo、Textarea 的 Enter 提交与 Shift-Enter 换行，
+以及 Editor 补全 → 接受 → Undo。每个流程读取新的快照，必要时结合公开状态或应用事件验证。
+补全使用提供固定响应的 provider，不连接实际语言服务器。
+独立的 `input_focus` 目标在 window update 结束后验证焦点回调。
+测试还覆盖公开输入法接口的预编辑、UTF-16 范围、提交/取消与 Undo 边界，以及多光标、折叠、异步 provider 的取消和失败。
+普通 Input 改动以操作覆盖表和各平台 CI 为验收依据，并为实际改动补充回归用例，减少重复手工检查整套编辑操作。
+这些用例不证明完整的系统 IME、辅助功能动作、系统剪贴板或像素显示正确；
+这些边界需要相应的平台验证。
 
 通过 `WindowExt` 打开 Dialog、Sheet 或 Notification 的视图，需要窗口的根视图是 `Root`。
 `Root` 始终将这三类浮层渲染在应用内容之上，缓存视图也一样，无需手动挂载。
@@ -317,40 +435,57 @@ GPUI 没有公开未观察祖先的继承绘制透明度，因此无法推断该
 
 失败时按具体情况检查注册路径、观察配置、完成帧、键盘焦点、裁剪与覆盖层、异步完成条件。
 
+| 现象 | 优先检查 |
+| --- | --- |
+| 找不到 `mod common` | 连同 `tests/ui.rs` 复制 `tests/common/mod.rs`，或改用应用自己的窗口设置代码。 |
+| `find` 列不出匹配路径 | 检查 `test-support`、控件 ID 或 `.test_support()`，以及首次查询前的 `render_frame`。 |
+| 查询结果不唯一 | 用 `within` 定位已有父级，再查询子控件 ID。 |
+| `focused()` 提示遗漏绑定，或作用域 `input` 报错 | 在 `.track_focus(&handle)` 前观察元素，输入前点击正确的输入框。 |
+| 断言仍读到旧状态 | 完成帧后重新查询快照；若工作已排队，离开 `update_window` 并使用 `wait_for`。 |
+| 目标可见却收不到点击 | 检查裁剪和浮层顺序；指针辅助方法使用原生命中测试。 |
+
 ## 独立验证绘制结果
 
 值或勾选标志正确，不代表控件正确绘制。GPUI 提供
 `HeadlessAppContext::with_platform`、`Window::render_to_image` 和
-`HeadlessAppContext::capture_screenshot`，可以生成真实离屏图片。当前锁定版本的
-平台 crate 仅在 macOS 提供 Metal 离屏渲染器。在支持 Metal 的 Mac 上执行：
+`HeadlessAppContext::capture_screenshot`，可以生成真实离屏图片。当前锁定的
+GPUI {{gpui_pre_version}} 平台 crate 在 macOS 提供 Metal 离屏渲染器，在 Linux 提供 WGPU
+离屏渲染器。使用可用的 Metal 或 WGPU 适配器 执行以下命令；Linux 可以使用
+Mesa lavapipe 等软件 Vulkan 适配器：
 
 ```sh
 cargo test -p gpui-kit --features test-support --test rendering --locked
 ```
 
-该目标设置了 `test = false`，默认 Cargo 命令不会选择它。macOS CI job 已增加必须
-通过的独立步骤，显式执行 `--test rendering`；Linux 和 Windows 只运行交互与布局
-测试。这使用 Cargo 的
+该目标设置了 `test = false`，默认 Cargo 命令不会选择它。macOS 和 Linux CI job
+都通过必需的独立步骤显式执行 `--test rendering`，同时运行交互与布局测试；
+Windows 运行交互与布局测试。这使用 Cargo 的
 [显式目标选择](https://doc.rust-lang.org/cargo/commands/cargo-test.html#target-selection)。
 目标还使用 `harness = false`，因为 AppKit 必须在主线程初始化；普通 Rust
-测试即使指定 `--test-threads=1` 仍运行在工作线程。其他平台明确报告跳过像素验证；
-macOS 缺少渲染能力时测试失败，不用假图片替代。
+测试即使指定 `--test-threads=1` 仍运行在工作线程。锁定版本的平台 crate 没有
+Windows 离屏渲染器，因此 Windows 明确报告跳过像素验证；macOS 或 Linux 缺少
+渲染能力时测试失败，不用假图片替代。
 
 测试向真实 Kit 控件注入两种故障：`checked()` 仍为 true，但勾号资源丢失；
 `value()` 仍正确，但输入文字变透明。故障图片必须与正常控件不同，重复绘制正常
-Checkbox 的图片必须一致。另一个原生事件测试断开 Checkbox 的状态更新处理器，
+Checkbox 的图片必须一致。受控 Checkbox 用例还在明暗主题下验证：鼠标按下时
+应用值和画面保持不变，释放时值只更新一次，画面同步更新。
+完整测试套件还检查含行内代码的 CJK 文本换行、明暗
+主题下焦点线的位置与对比度、指针激活 Button 时没有焦点线、指针与键盘切换时
+Menu 只有一个高亮项、List 的键盘选中状态，以及开启或关闭焦点环时 Table 只在
+键盘聚焦后显示焦点样式。另一个原生事件测试断开 Checkbox 的状态更新处理器，
 验证点击不会凭空产生已勾选结果。
 
 这些测试验证能否发现特定错误，不是完整的基准图片回归测试。应用的视觉回归应在
 固定字体、尺寸、主题、焦点和动画状态下，将图片与已审查的预期结果比较。状态与
 图片断言能发现不同的故障；两者都不能证明打包应用或完整 IME 行为正确。
 可执行示例见
-[`crates/kit/tests/rendering.rs`](https://github.com/longbridge/gpui-kit/blob/testing/crates/kit/tests/rendering.rs)。
+[`crates/kit/tests/rendering.rs`](https://github.com/longbridge/gpui-kit/blob/main/crates/kit/tests/rendering.rs)。
 
 ## 接入 CI
 
-Kit 仓库在 macOS、Linux 和 Windows 矩阵中运行交互与布局测试。macOS job 还运行两个
-Metal 像素测试，失败会使 job 失败。以下是用于 Kit 检出目录的最小 macOS workflow：
+Kit 仓库在 macOS、Linux 和 Windows 矩阵中运行交互与布局测试。macOS 和 Linux
+job 还分别通过 Metal 和 WGPU 运行完整绘制测试套件，失败会使 job 失败。以下是用于 Kit 检出目录的最小 macOS workflow：
 
 ```yaml
 name: UI tests

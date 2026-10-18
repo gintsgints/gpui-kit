@@ -779,7 +779,7 @@ impl<T> Plot for FlameGraph<T> {
         self.hover = hover.and_then(|hover| {
             Some(FlameHover {
                 path: geometry.path_at(hover.state().cross_line)?,
-                focus: hover.focus(),
+                focus: hover.progress(),
             })
         });
     }

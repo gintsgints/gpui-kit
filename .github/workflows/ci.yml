@@ -6,6 +6,9 @@ on:
       - main
     tags:
       - "*"
+      # `shell-<tag>` only records which commit a release's gpui-shell
+      # binaries were built from; that commit has been tested already.
+      - "!shell-*"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'main' && github.sha || 'anysha' }}
@@ -54,9 +57,13 @@ jobs:
           components: clippy
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       # Lints every member and, as a side effect, type-checks the example
-      # crates that the `test` job leaves out.
+      # crates that the `test` job leaves out. `gpui-webview` enables
+      # `gpui-kit/gpui-fast`, which feature unification would spread to every
+      # member, so it and its example are linted on their own.
       - name: Lint
-        run: cargo clippy --workspace --exclude gpui-shell --locked -- --deny warnings
+        run: cargo clippy --workspace --exclude gpui-shell --exclude gpui-webview --exclude webview --locked -- --deny warnings
+      - name: Lint WebView (GPUI Fast)
+        run: cargo clippy -p gpui-webview -p webview --locked -- --deny warnings
 
   no-default-features:
     name: No default features
@@ -108,6 +115,8 @@ jobs:
       # most of the warm-cache build time; the `lint` job type-checks them
       # instead. Leaving them out changes no crate's feature set. The recipes
       # crate stays in: its tests are what certify the documentation's code.
+      # `gpui-webview` enables `gpui-kit/gpui-fast`, which feature unification
+      # would spread to every member; the GPUI Fast job tests it instead.
       # `jq -j` writes the list as one line with no newline at all: on Windows
       # `jq` emits CRLF, and a `\r` left on a name breaks `--exclude`.
       - name: Leave the example crates to the lint job
@@ -115,8 +124,8 @@ jobs:
           excludes=$(cargo metadata --no-deps --format-version 1 | jq -j '
             ((.workspace_root | gsub("\\\\"; "/")) + "/examples/") as $examples
             | .packages[]
-            | select((.manifest_path | gsub("\\\\"; "/")) | startswith($examples))
-            | select(.name != "gpui-kit-recipes")
+            | select((((.manifest_path | gsub("\\\\"; "/")) | startswith($examples))
+                and .name != "gpui-kit-recipes") or .name == "gpui-webview")
             | "--exclude \(.name) "')
           echo "TEST_EXCLUDES=$excludes" >> "$GITHUB_ENV"
       # `gpui-component-story/test-support` turns on `gpui-kit/test-support`, so
@@ -133,15 +142,63 @@ jobs:
           cargo test --workspace --exclude gpui-shell
           --features gpui-component-story/test-support --locked
           $TEST_EXCLUDES --doc
-      # `crates/kit/tests/rendering.rs` needs a real Metal device and is opted
+      # `crates/kit/tests/rendering.rs` needs a real renderer and is opted
       # out of the default test set; select it with the same feature set so it
       # reuses the build above.
-      - name: Metal UI rendering tests
-        if: ${{ matrix.run_on == 'macos-latest' }}
+      - name: Install Linux offscreen renderer
+        if: ${{ matrix.run_on == 'ubuntu-latest' }}
+        run: sudo apt-get install -y mesa-vulkan-drivers
+      - name: UI rendering tests
+        if: ${{ matrix.run_on != 'windows-latest' }}
         run: >-
           cargo test --workspace --exclude gpui-shell
           --features gpui-component-story/test-support --locked
           $TEST_EXCLUDES --test rendering
+
+  gpui-fast:
+    name: GPUI Fast (${{ matrix.run_on }})
+    strategy:
+      fail-fast: false
+      matrix:
+        run_on: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.run_on }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-shared-key: gpui-fast
+      - uses: rui314/setup-mold@v1
+      - name: Install system dependencies
+        if: ${{ matrix.run_on != 'windows-latest' }}
+        run: script/bootstrap
+      - name: Test GPUI Fast facade and UI integration
+        run: cargo test -p gpui-kit --features gpui-fast,test-support --locked
+      - name: Test Component tooltip lifecycle with GPUI Fast
+        run: >-
+          cargo test -p gpui-component --features gpui-fast,test-support
+          --lib tooltip::tests:: --locked
+      - name: Test WebView
+        run: cargo test -p gpui-webview --locked
+
+  gpui-fast-web:
+    name: GPUI Fast (WebAssembly)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: nightly
+          target: wasm32-unknown-unknown
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-shared-key: gpui-fast-web
+      - name: Install system dependencies
+        run: script/bootstrap
+      - name: Check GPUI Fast WebAssembly
+        run: cargo check -p gpui-kit --features gpui-fast --target wasm32-unknown-unknown --locked
 
   gpui-shell-core:
     name: GPUI Shell Core
@@ -169,9 +226,13 @@ jobs:
           cargo test -p gpui-shell --release --doc
       - name: Lint GPUI Shell
         run: cargo clippy -p gpui-shell --all-targets -- -D warnings
+      # The `components` feature is the only edge to `gpui-component`; the
+      # runtime must still build without it.
+      - name: Check GPUI Shell without the component catalog
+        run: cargo check -p gpui-shell --no-default-features --features quickjs
 
-  gpui-component-shell:
-    name: GPUI Component Shell
+  gpui-shell-components:
+    name: GPUI Shell Components
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -186,14 +247,14 @@ jobs:
       - uses: rui314/setup-mold@v1
       - name: Install system dependencies
         run: script/bootstrap
+      # The catalog's unit tests run with the library in `gpui-shell-core`;
+      # these are its host integration tests and the command-line tests.
       - name: Test component bindings
-        run: cargo test -p gpui-component-shell --all-targets
+        run: cargo test -p gpui-shell --tests
       - name: Verify generated TypeScript contracts
         run: |
-          npm --prefix crates/component-shell/tests/types ci
-          npm --prefix crates/component-shell/tests/types test
-      - name: Lint component bindings
-        run: cargo clippy -p gpui-component-shell --all-targets -- -D warnings
+          npm --prefix crates/shell/tests/types ci
+          npm --prefix crates/shell/tests/types test
       # The inventory test proves every public component is registered or
       # explicitly deferred; this proves the JavaScript gallery covers what the
       # inventory claims. Without it the two drift silently.

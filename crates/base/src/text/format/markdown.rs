@@ -1,4 +1,4 @@
-use std::{ops::Range, sync::Arc};
+use std::{collections::BTreeMap, ops::Range, sync::Arc};
 
 use gpui::SharedString;
 use markdown::{
@@ -140,8 +140,8 @@ fn inline_groups(children: &[Node]) -> Vec<InlineGroup<'_>> {
     let mut groups = Vec::with_capacity(children.len());
     let mut ix = 0;
     while ix < children.len() {
-        if let Some((false, name)) = inline_html_tag(&children[ix])
-            && let Some(mark) = inline_html_mark(&name)
+        if let Some((false, name, attrs)) = inline_html_tag(&children[ix])
+            && let Some(mark) = inline_html_mark(&name, attrs)
             && let Some(close) = matching_close_tag(children, ix, &name)
         {
             groups.push(InlineGroup::Marked(mark, &children[ix + 1..close]));
@@ -154,7 +154,7 @@ fn inline_groups(children: &[Node]) -> Vec<InlineGroup<'_>> {
     groups
 }
 
-fn inline_html_tag(node: &Node) -> Option<(bool, String)> {
+fn inline_html_tag(node: &Node) -> Option<(bool, String, &str)> {
     let Node::Html(html) = node else {
         return None;
     };
@@ -166,20 +166,67 @@ fn inline_html_tag(node: &Node) -> Option<(bool, String)> {
         Some(rest) => (true, rest),
         None => (false, inner),
     };
-    let name = rest
-        .chars()
-        .take_while(char::is_ascii_alphanumeric)
-        .collect::<String>()
-        .to_ascii_lowercase();
-    (!name.is_empty()).then_some((closing, name))
+    let name_len = rest.chars().take_while(char::is_ascii_alphanumeric).count();
+    let name = rest[..name_len].to_ascii_lowercase();
+    let attrs = rest[name_len..].trim();
+    (!name.is_empty()).then_some((closing, name, attrs))
 }
 
-fn inline_html_mark(name: &str) -> Option<TextMark> {
+fn inline_html_attr<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
+    let mut rest = attrs;
+    while !rest.is_empty() {
+        rest = rest.trim_start();
+        let key_len = rest
+            .find(|c: char| c.is_whitespace() || matches!(c, '=' | '/' | '>'))
+            .unwrap_or(rest.len());
+        if key_len == 0 {
+            break;
+        }
+        let key = &rest[..key_len];
+        rest = rest[key_len..].trim_start();
+        let value = if let Some(after_eq) = rest.strip_prefix('=') {
+            rest = after_eq.trim_start();
+            if let Some(quote) = rest
+                .as_bytes()
+                .first()
+                .copied()
+                .filter(|b| *b == b'"' || *b == b'\'')
+            {
+                rest = &rest[1..];
+                let end = rest.find(quote as char)?;
+                let value = &rest[..end];
+                rest = &rest[end + 1..];
+                value
+            } else {
+                let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                let value = &rest[..end];
+                rest = &rest[end..];
+                value
+            }
+        } else {
+            ""
+        };
+        if key.eq_ignore_ascii_case(name) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn inline_html_mark(name: &str, attrs: &str) -> Option<TextMark> {
     Some(match name {
         "strong" | "b" => TextMark::default().bold(),
         "em" | "i" => TextMark::default().italic(),
         "u" => TextMark::default().underline(),
         "s" | "del" | "strike" => TextMark::default().strikethrough(),
+        "mark" => {
+            let color = super::html::mark_color_from_values(
+                inline_html_attr(attrs, "color"),
+                inline_html_attr(attrs, "style"),
+            )
+            .unwrap_or_else(super::html::default_mark_color);
+            TextMark::default().highlight(color)
+        }
         _ => return None,
     })
 }
@@ -188,8 +235,8 @@ fn matching_close_tag(children: &[Node], open: usize, name: &str) -> Option<usiz
     let mut depth = 0usize;
     for (ix, child) in children.iter().enumerate().skip(open + 1) {
         match inline_html_tag(child) {
-            Some((false, tag)) if tag == name => depth += 1,
-            Some((true, tag)) if tag == name => {
+            Some((false, tag, _)) if tag == name => depth += 1,
+            Some((true, tag, _)) if tag == name => {
                 if depth == 0 {
                     return Some(ix);
                 }
@@ -233,6 +280,10 @@ fn parse_table_row(source: &str, table: &mut Table, node: &mdast::TableRow, cx: 
             _ => {}
         };
     });
+    // GFM fixes the column count with the header/delimiter, not each body row.
+    // Padding/truncation keeps every row on the same measured column grid.
+    row.children
+        .resize_with(table.column_aligns.len(), Default::default);
     table.children.push(row);
 }
 
@@ -389,14 +440,33 @@ fn source_segments(
         return Vec::new();
     };
 
-    let mut segments = aligned_source_segments(raw, rendered, span.start, true);
+    let mut segments = aligned_source_segments(raw, rendered, span.start, true, true);
 
+    // The text node of an escaped character starts after its backslash. The
+    // backslash and the character map as a whole; the rest of the run stays
+    // linear.
     if include_preceding_escape
         && let Some(previous) = local_start.checked_sub(1)
         && source.as_bytes().get(previous) == Some(&b'\\')
         && let Some(first) = segments.first_mut()
     {
+        let first_char_len = rendered[first.rendered.start..]
+            .chars()
+            .next()
+            .map_or(0, char::len_utf8);
+        if first.linear && first.rendered.len() > first_char_len {
+            let rest = SourceSegment {
+                rendered: first.rendered.start + first_char_len..first.rendered.end,
+                source: first.source.start + first_char_len..first.source.end,
+                linear: true,
+            };
+            first.rendered.end = rest.rendered.start;
+            first.source.end = rest.source.start;
+            segments.insert(1, rest);
+        }
+        let first = &mut segments[0];
         first.source.start -= 1;
+        first.linear = false;
     }
     segments
 }
@@ -406,22 +476,44 @@ fn aligned_source_segments(
     rendered: &str,
     source_offset: usize,
     decode_entities: bool,
+    decode_escapes: bool,
 ) -> Vec<SourceSegment> {
     let mut segments = Vec::new();
     let mut raw_cursor = 0;
     let mut rendered_start = 0;
+    let mut whitespace_end = 0;
+    let mut source_positions = None;
+    let mut entity_cursor = None;
+    let mut entity = None;
+    // Only the final LF may absorb source-only text before it. Find the
+    // preceding line boundary once instead of recounting the suffix per LF.
+    let final_line_start = raw
+        .strip_suffix('\n')
+        .and_then(|prefix| prefix.rfind('\n'))
+        .map_or(0, |newline| newline + 1);
+
     while rendered_start < rendered.len() {
-        if decode_entities
-            && let Some((decoded, source_len)) = decoded_entity(&raw[raw_cursor..])
-            && rendered[rendered_start..].starts_with(&decoded)
+        if decode_entities && entity_cursor != Some(raw_cursor) {
+            entity = decoded_entity(&raw[raw_cursor..]);
+            entity_cursor = Some(raw_cursor);
+        }
+        if let Some((decoded, source_len)) = &entity
+            && rendered[rendered_start..].starts_with(decoded.as_str())
         {
             let rendered_end = rendered_start + decoded.len();
-            segments.push(SourceSegment {
-                rendered: rendered_start..rendered_end,
-                source: (source_offset + raw_cursor)..(source_offset + raw_cursor + source_len),
-            });
+            push_source_segment(
+                &mut segments,
+                SourceSegment {
+                    rendered: rendered_start..rendered_end,
+                    source: (source_offset + raw_cursor)
+                        ..(source_offset + raw_cursor + *source_len),
+                    // Even when the decoded characters take as many bytes as the
+                    // entity, as `∾̳` and `&acE;` do, they are not one for one.
+                    linear: false,
+                },
+            );
             rendered_start = rendered_end;
-            raw_cursor += source_len;
+            raw_cursor += *source_len;
             continue;
         }
 
@@ -431,31 +523,40 @@ fn aligned_source_segments(
             .expect("rendered cursor must be on a character boundary");
         let rendered_end = rendered_start + rendered_char.len_utf8();
         let remainder = &raw[raw_cursor..];
+        if rendered_char == ' ' && raw_cursor >= whitespace_end {
+            // Reuse this boundary while consuming a run of literal spaces.
+            // Otherwise a long horizontal-whitespace run also costs O(n^2).
+            whitespace_end = raw_cursor
+                + remainder
+                    .bytes()
+                    .position(|byte| !matches!(byte, b' ' | b'\t'))
+                    .unwrap_or(remainder.len());
+        }
         let (relative_start, source_len) = if rendered_char == ' '
-            && let Some(newline) = remainder.find(['\n', '\r'])
-            && remainder[..newline]
-                .chars()
-                .all(|character| matches!(character, ' ' | '\t'))
+            && matches!(raw.as_bytes().get(whitespace_end), Some(b'\n' | b'\r'))
         {
-            let newline_len = if remainder[newline..].starts_with("\r\n") {
+            let newline_len = if raw[whitespace_end..].starts_with("\r\n") {
                 2
             } else {
                 1
             };
-            (newline, newline_len)
+            (whitespace_end - raw_cursor, newline_len)
         } else if rendered_char == '\n'
             && remainder.ends_with('\n')
-            && remainder.bytes().filter(|byte| *byte == b'\n').count() == 1
+            && raw_cursor >= final_line_start
         {
             (0, remainder.len())
-        } else if let Some(escaped) = remainder.strip_prefix('\\')
+        } else if decode_escapes
+            && let Some(escaped) = remainder.strip_prefix('\\')
             && escaped.starts_with(rendered_char)
         {
             (0, 1 + rendered_char.len_utf8())
         } else if remainder.starts_with(rendered_char) {
             (0, rendered_char.len_utf8())
-        } else if let Some(relative_start) = remainder.find(rendered_char) {
-            (relative_start, rendered_char.len_utf8())
+        } else if let Some(source_start) =
+            source_char_offset(raw, raw_cursor, rendered_char, &mut source_positions)
+        {
+            (source_start - raw_cursor, rendered_char.len_utf8())
         } else {
             // Decoded entities and other source-only syntax have no exact
             // rendered-byte mapping. Leave a rendered gap for this
@@ -465,32 +566,65 @@ fn aligned_source_segments(
         };
         let source_start = raw_cursor + relative_start;
         let source_end = source_start + source_len;
-        segments.push(SourceSegment {
-            rendered: rendered_start..rendered_end,
-            source: (source_offset + source_start)..(source_offset + source_end),
-        });
+        push_source_segment(
+            &mut segments,
+            SourceSegment {
+                rendered: rendered_start..rendered_end,
+                source: (source_offset + source_start)..(source_offset + source_end),
+                linear: source_len == rendered_char.len_utf8(),
+            },
+        );
         raw_cursor = source_end;
         rendered_start = rendered_end;
     }
-    compact_source_segments(segments)
+    segments
 }
 
-fn compact_source_segments(segments: Vec<SourceSegment>) -> Vec<SourceSegment> {
-    let mut compacted: Vec<SourceSegment> = Vec::with_capacity(segments.len());
-    for segment in segments {
-        if let Some(previous) = compacted.last_mut()
-            && previous.rendered.end == segment.rendered.start
-            && previous.source.end == segment.source.start
-            && previous.rendered.len() == previous.source.len()
-            && segment.rendered.len() == segment.source.len()
-        {
-            previous.rendered.end = segment.rendered.end;
-            previous.source.end = segment.source.end;
-        } else {
-            compacted.push(segment);
-        }
+fn source_char_offset(
+    raw: &str,
+    raw_cursor: usize,
+    character: char,
+    positions: &mut Option<BTreeMap<char, Vec<usize>>>,
+) -> Option<usize> {
+    if let Some(positions) = positions.as_ref() {
+        let offsets = positions.get(&character)?;
+        return offsets
+            .get(offsets.partition_point(|&offset| offset < raw_cursor))
+            .copied();
     }
-    compacted
+    if let Some(offset) = raw[raw_cursor..].find(character) {
+        return Some(raw_cursor + offset);
+    }
+
+    // Successful searches advance raw_cursor, so their scans do not overlap.
+    // A missing character does not advance it. Index the remaining source only
+    // after the first miss so later gaps cannot repeatedly scan that suffix.
+    let mut indexed = BTreeMap::<char, Vec<usize>>::new();
+    for (offset, character) in raw[raw_cursor..].char_indices() {
+        indexed
+            .entry(character)
+            .or_default()
+            .push(raw_cursor + offset);
+    }
+    *positions = Some(indexed);
+    None
+}
+
+/// Pushes `segment`, merging it into the previous one when both are linear and
+/// adjacent, so that a merged run still maps byte for byte. Any other segment
+/// is kept whole on its own.
+fn push_source_segment(segments: &mut Vec<SourceSegment>, segment: SourceSegment) {
+    if let Some(previous) = segments.last_mut()
+        && previous.linear
+        && segment.linear
+        && previous.rendered.end == segment.rendered.start
+        && previous.source.end == segment.source.start
+    {
+        previous.rendered.end = segment.rendered.end;
+        previous.source.end = segment.source.end;
+    } else {
+        segments.push(segment);
+    }
 }
 
 fn decoded_entity(source: &str) -> Option<(String, usize)> {
@@ -561,6 +695,7 @@ fn code_source_segments(
         &raw[body_start..body_end],
         code,
         span.start + body_start,
+        false,
         false,
     )
 }
@@ -845,7 +980,10 @@ fn ast_to_node(source: &str, value: mdast::Node, cx: &mut NodeContext) -> BlockN
     let parse_cx = MarkdownParseContext::new(source, cx.offset);
     if let Some(mut node) = cx.markdown_extensions.parse_block(&value, &parse_cx) {
         node.set_span(span);
-        return BlockNode::Custom(node);
+        return BlockNode::Custom {
+            node,
+            state: Default::default(),
+        };
     }
 
     match value {
@@ -902,6 +1040,7 @@ fn ast_to_node(source: &str, value: mdast::Node, cx: &mut NodeContext) -> BlockN
             let segments = code_source_segments(source, &raw.value, span, cx.offset);
             BlockNode::CodeBlock(
                 CodeBlock::new(raw.value.into(), raw.lang.map(Into::into), span)
+                    .with_meta(raw.meta.map(Into::into))
                     .source_segments(segments),
             )
         }
@@ -1128,6 +1267,24 @@ mod tests {
     }
 
     #[test]
+    fn table_rows_use_header_column_count() {
+        let mut cx = NodeContext::default();
+        let document = parse(
+            "| A | B | C |\n| --- | --- | --- |\n| one |\n| two | three | four | ignored |\n",
+            &mut cx,
+        )
+        .unwrap();
+        let BlockNode::Table(table) = &document.blocks[0] else {
+            panic!("expected table");
+        };
+        assert_eq!(table.column_aligns.len(), 3);
+        assert!(table.children.iter().all(|row| row.children.len() == 3));
+        assert_eq!(table.children[1].children[0].children.text(), "one");
+        assert!(table.children[1].children[1].children.text().is_empty());
+        assert_eq!(table.children[2].children[2].children.text(), "four");
+    }
+
+    #[test]
     fn selected_source_range_uses_the_selected_identical_styled_occurrence() {
         let source = "**same** then **same**";
         assert_eq!(select_rendered_range(source, 10..14), 16..20);
@@ -1150,10 +1307,166 @@ mod tests {
             vec![SourceSegment {
                 rendered: 0..source.len(),
                 source: 0..source.len(),
+                linear: true,
             }]
         );
 
         assert_eq!(select_rendered_range(source, 2..7), 2..7);
+    }
+
+    #[test]
+    fn source_alignment_compacts_long_whitespace_runs() {
+        for raw in [
+            "a ".repeat(16_384),
+            format!("a{}b", " ".repeat(32_768)),
+            format!("a{}b\n", " \t".repeat(16_384)),
+        ] {
+            let segments = aligned_source_segments(&raw, &raw, 7, true, true);
+            assert_eq!(
+                segments,
+                vec![SourceSegment {
+                    rendered: 0..raw.len(),
+                    source: 7..7 + raw.len(),
+                    linear: true,
+                }]
+            );
+            assert!(
+                segments.capacity() < 64,
+                "compaction must not retain a per-character allocation"
+            );
+        }
+    }
+
+    #[test]
+    fn source_alignment_preserves_multiline_code_and_final_newline() {
+        let raw = "x\n".repeat(16_384);
+        let rendered = &raw[..raw.len() - 1];
+        assert_eq!(
+            aligned_source_segments(&raw, rendered, 4, false, false),
+            vec![SourceSegment {
+                rendered: 0..rendered.len(),
+                source: 4..4 + rendered.len(),
+                linear: true,
+            }]
+        );
+        assert_eq!(
+            aligned_source_segments("a\n> \n", "a\n\n", 0, false, false),
+            vec![
+                SourceSegment {
+                    rendered: 0..2,
+                    source: 0..2,
+                    linear: true,
+                },
+                SourceSegment {
+                    rendered: 2..3,
+                    source: 2..5,
+                    linear: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn source_alignment_keeps_soft_breaks_and_entities_atomic() {
+        assert_eq!(
+            aligned_source_segments("a \r\nb", "a b", 9, true, true),
+            vec![
+                SourceSegment {
+                    rendered: 0..1,
+                    source: 9..10,
+                    linear: true,
+                },
+                SourceSegment {
+                    rendered: 1..2,
+                    source: 11..13,
+                    linear: false,
+                },
+                SourceSegment {
+                    rendered: 2..3,
+                    source: 13..14,
+                    linear: true,
+                },
+            ]
+        );
+        let entity = "&NotEqualTilde;";
+        let decoded = "\u{2242}\u{338}";
+        assert_eq!(
+            aligned_source_segments(entity, decoded, 3, true, true),
+            vec![SourceSegment {
+                rendered: 0..decoded.len(),
+                source: 3..3 + entity.len(),
+                linear: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn source_alignment_resumes_after_unmapped_characters() {
+        let raw = "abc".repeat(4_096);
+        let mut positions = None;
+        assert_eq!(source_char_offset(&raw, 0, 'b', &mut positions), Some(1));
+        assert!(positions.is_none(), "successful scans need no index");
+        assert_eq!(
+            source_char_offset(&raw, 0, '\u{fffd}', &mut positions),
+            None
+        );
+        assert!(positions.is_some(), "failed scans must not be repeated");
+        assert_eq!(source_char_offset(&raw, 2, 'b', &mut positions), Some(4));
+        assert_eq!(
+            source_char_offset(&raw, raw.len(), 'a', &mut positions),
+            None
+        );
+
+        let missing = "\u{fffd}".repeat(4_096);
+        assert_eq!(
+            aligned_source_segments(&raw, &format!("{missing}abc"), 5, true, true),
+            vec![SourceSegment {
+                rendered: missing.len()..missing.len() + 3,
+                source: 5..8,
+                linear: true,
+            }]
+        );
+        assert_eq!(
+            aligned_source_segments("&amp;z", &format!("{missing}&z"), 0, true, true),
+            vec![
+                SourceSegment {
+                    rendered: missing.len()..missing.len() + 1,
+                    source: 0..5,
+                    linear: false,
+                },
+                SourceSegment {
+                    rendered: missing.len() + 1..missing.len() + 2,
+                    source: 5..6,
+                    linear: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn source_alignment_parses_long_text_and_code_without_selection() {
+        let source = format!("{}end", "a ".repeat(4_096));
+        let mut cx = NodeContext::default();
+        let document = parse(&source, &mut cx).unwrap();
+        let paragraph = first_paragraph(&document.blocks[0]).unwrap();
+        assert_eq!(paragraph.text(), source);
+        let segments = &paragraph.children[0].source_segments;
+        assert_eq!(segments.len(), 1);
+        assert!(segments.capacity() < 64);
+        assert_eq!(segments[0].source, 0..source.len());
+        assert_eq!(
+            selected_rendered_range(&source, source.len() - 3..source.len()),
+            Some(source.len() - 3..source.len())
+        );
+
+        let body = "x\n".repeat(4_096);
+        let source = format!("```\n{body}```");
+        let document = parse(&source, &mut cx).unwrap();
+        assert!(first_code_block(&document.blocks[0]).is_some());
+        assert_eq!(
+            selected_code_range(&source, body.len() - 2..body.len() - 1),
+            Some(body.len() + 2..body.len() + 3)
+        );
     }
 
     #[test]
@@ -1171,14 +1484,48 @@ mod tests {
         assert!(segments.contains(&SourceSegment {
             rendered: 1..2,
             source: 1..3,
+            linear: false,
         }));
         assert!(segments.contains(&SourceSegment {
             rendered: 3..4,
             source: 4..9,
+            linear: false,
         }));
 
         assert_eq!(select_rendered_range(source, 1..2), 1..3);
         assert_eq!(select_rendered_range(source, 3..4), 4..9);
+    }
+
+    #[test]
+    fn source_segments_keep_an_entity_as_long_as_its_characters_atomic() {
+        // `&acE;` decodes to `∾̳`: five bytes each, but not one for one.
+        let source = "a &acE; b";
+        let mut cx = NodeContext::default();
+        let document = parse(source, &mut cx).unwrap();
+        let paragraph = first_paragraph(&document.blocks[0]).unwrap();
+        assert_eq!(paragraph.children[0].text.as_ref(), "a ∾̳ b");
+        assert_eq!(
+            paragraph.children[0].source_segments,
+            vec![
+                SourceSegment {
+                    rendered: 0..2,
+                    source: 0..2,
+                    linear: true,
+                },
+                SourceSegment {
+                    rendered: 2..7,
+                    source: 2..7,
+                    linear: false,
+                },
+                SourceSegment {
+                    rendered: 7..9,
+                    source: 7..9,
+                    linear: true,
+                },
+            ]
+        );
+        // Selecting the combining mark alone reports the whole entity.
+        assert_eq!(select_rendered_range(source, 5..7), 2..7);
     }
 
     #[test]
@@ -1206,6 +1553,16 @@ mod tests {
 
         let literal_entity = "`&amp;`";
         assert_eq!(selected_rendered_range(literal_entity, 0..5), Some(1..6));
+    }
+
+    #[test]
+    fn selected_source_range_keeps_inline_code_escapes_literal() {
+        assert_eq!(select_rendered_range("`a\\\\b`", 1..2), 2..3);
+        assert_eq!(select_rendered_range("`a\\\\b`", 2..3), 3..4);
+        assert_eq!(select_rendered_range(r"`a\*b`", 1..2), 2..3);
+        assert_eq!(select_rendered_range(r"`a\*b`", 2..3), 3..4);
+        // The same punctuation is still an escape outside code.
+        assert_eq!(select_rendered_range(r"a\*b", 1..2), 1..3);
     }
 
     #[test]
@@ -1271,6 +1628,23 @@ mod tests {
     }
 
     #[test]
+    fn selected_source_range_maps_each_literal_backslash_in_fenced_code() {
+        let source = "```\na\\\\b\n```";
+        assert_eq!(selected_code_range(source, 1..2), Some(5..6));
+        assert_eq!(selected_code_range(source, 2..3), Some(6..7));
+        assert_eq!(selected_code_range(source, 1..3), Some(5..7));
+        let punctuation = "```\na\\*b\n```";
+        assert_eq!(selected_code_range(punctuation, 1..2), Some(5..6));
+        assert_eq!(selected_code_range(punctuation, 2..3), Some(6..7));
+        assert_eq!(selected_code_range("```\na\\\\b\r\n```", 1..3), Some(5..7));
+        let multiline = "```\na\\\\\nb\n```";
+        assert_eq!(selected_code_range(multiline, 1..2), Some(5..6));
+        assert_eq!(selected_code_range(multiline, 2..3), Some(6..7));
+        assert_eq!(selected_code_range(multiline, 3..4), Some(7..8));
+        assert_eq!(selected_code_range(multiline, 4..5), Some(8..9));
+    }
+
+    #[test]
     fn selected_source_range_excludes_closing_fence_candidate() {
         let source = "````text\n```\n````";
         let mut cx = NodeContext::default();
@@ -1305,11 +1679,27 @@ mod tests {
     }
 
     #[test]
+    fn selected_source_range_maps_literal_backslashes_in_indented_code() {
+        let source = "    one\n    a\\\\b";
+        assert_eq!(selected_code_range(source, 5..6), Some(13..14));
+        assert_eq!(selected_code_range(source, 6..7), Some(14..15));
+        assert_eq!(selected_code_range(source, 5..7), Some(13..15));
+    }
+
+    #[test]
     fn selected_source_range_maps_fenced_code_nested_in_a_list() {
         let source = "- ```rust\n  one\n  two\n  ```";
         assert_eq!(selected_code_range(source, 0..3), Some(12..15));
         assert_eq!(selected_code_range(source, 4..7), Some(18..21));
         assert_eq!(selected_code_range(source, 0..7), Some(12..21));
+    }
+
+    #[test]
+    fn selected_source_range_maps_literal_backslashes_in_nested_fences() {
+        for source in ["- ```\n  a\\\\b\n  ```", "> ```\n> a\\\\b\n> ```"] {
+            assert_eq!(selected_code_range(source, 1..2), Some(9..10));
+            assert_eq!(selected_code_range(source, 2..3), Some(10..11));
+        }
     }
 
     #[test]
@@ -1331,6 +1721,18 @@ mod tests {
     #[test]
     fn selected_source_range_maps_the_whole_markdown_escape() {
         assert_eq!(selected_rendered_range(r"\*", 0..1), Some(0..2));
+    }
+
+    #[test]
+    fn selected_source_range_maps_text_after_an_escape_character_for_character() {
+        let source = r"\*abc";
+        assert_eq!(select_rendered_range(source, 0..1), 0..2);
+        assert_eq!(select_rendered_range(source, 2..3), 3..4);
+        assert_eq!(select_rendered_range(source, 0..2), 0..3);
+        // Only punctuation escapes, so a backslash before a letter is text.
+        let source = r"\été";
+        assert_eq!(select_rendered_range(source, 0..1), 0..1);
+        assert_eq!(select_rendered_range(source, 1..3), 1..3);
     }
 
     #[test]
@@ -1756,7 +2158,7 @@ mod tests {
         };
         let document = parse("$TSLA.US", &mut cx).unwrap();
 
-        let BlockNode::Custom(node) = &document.blocks[0] else {
+        let BlockNode::Custom { node, .. } = &document.blocks[0] else {
             panic!("expected custom markdown node");
         };
         assert_eq!(node.name(), "ticker");
@@ -1942,6 +2344,54 @@ mod tests {
         assert_eq!(marked(|mark| mark.strikethrough), ["h"]);
     }
 
+    fn highlight_runs(paragraph: &Paragraph) -> Vec<(String, gpui::Hsla)> {
+        paragraph
+            .children
+            .iter()
+            .flat_map(|node| {
+                node.marks
+                    .iter()
+                    .filter_map(|(range, mark)| {
+                        mark.highlight
+                            .map(|color| (node.text[range.clone()].to_string(), color))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Inline `<mark>` is paired like `<strong>` and keeps the same color
+    /// rules as the block HTML path: default yellow, `color`, then
+    /// `style="background-color"`.
+    #[test]
+    fn inline_html_mark_applies_highlight_colors() {
+        let source = concat!(
+            r#"Plain <mark>highlighted</mark> text and "#,
+            r##"<mark data_id="1" color="#ff000059">red</mark> and "##,
+            r#"<mark style="background-color: #336699">hex</mark>."#
+        );
+        let mut cx = NodeContext::default();
+        let document = parse(source, &mut cx).unwrap();
+        assert_eq!(document.text(), "Plain highlighted text and red and hex.\n");
+        let BlockNode::Paragraph(paragraph) = &document.blocks[0] else {
+            panic!()
+        };
+        assert_eq!(
+            highlight_runs(paragraph),
+            [
+                ("highlighted".into(), gpui::rgb(0xfef08a).into()),
+                (
+                    "red".into(),
+                    gpui::Rgba::try_from("#ff000059").unwrap().into()
+                ),
+                (
+                    "hex".into(),
+                    gpui::Rgba::try_from("#336699").unwrap().into()
+                ),
+            ]
+        );
+    }
+
     #[test]
     fn unclaimed_inline_math_keeps_its_literal_source() {
         // Math parsing is on by default, so prose that merely contains dollar
@@ -2071,7 +2521,7 @@ mod tests {
         };
         let document = parse("$TSLA.US", &mut cx).unwrap();
 
-        let BlockNode::Custom(node) = &document.blocks[0] else {
+        let BlockNode::Custom { node, .. } = &document.blocks[0] else {
             panic!("expected custom markdown node");
         };
         assert_eq!(node.name(), "ticker");

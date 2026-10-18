@@ -21,7 +21,7 @@ use crate::{
 };
 
 use super::{
-    InputBaseState, RangeDecorationStyle, TextDecoration,
+    InputBaseState, PrepaintCaretGeometry, RangeDecorationStyle, TextDecoration,
     layout::{LastLayout, WhitespaceIndicators},
     mode::LayoutMode,
 };
@@ -121,6 +121,21 @@ fn compose_decoration_collections<'a>(
 struct EditorScrollbarLayout {
     bounds: Bounds<Pixels>,
     scroll_size: Size<Pixels>,
+    // Excludes editor padding from scroll range while the track still includes it.
+    scroll_viewport_size: Size<Pixels>,
+}
+
+/// What the unwrapped width of the longest line depends on. While it holds,
+/// prepaint reuses the stored width instead of copying the line and asking
+/// the text system for it again on every frame.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct LongestLineKey {
+    document_revision: u64,
+    row: usize,
+    len: usize,
+    font: gpui::Font,
+    text_size: Pixels,
+    wrap_width: Option<Pixels>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -164,21 +179,24 @@ impl EditorScrollbarLayout {
             paddings.left + line_number_width - LINE_NUMBER_RIGHT_MARGIN
         };
 
-        Self {
-            bounds: Bounds::new(
-                point(
-                    input_bounds.origin.x + left,
-                    input_bounds.origin.y - paddings.top,
-                ),
-                size(
-                    input_bounds.size.width - left + paddings.right,
-                    input_bounds.size.height + paddings.top + paddings.bottom,
-                ),
+        let bounds = Bounds::new(
+            point(
+                input_bounds.origin.x + left,
+                input_bounds.origin.y - paddings.top,
             ),
+            size(
+                input_bounds.size.width - left + paddings.right,
+                input_bounds.size.height + paddings.top + paddings.bottom,
+            ),
+        );
+
+        Self {
+            bounds,
             scroll_size: size(
                 scroll_size.width - left + paddings.right + RIGHT_MARGIN,
                 scroll_size.height,
             ),
+            scroll_viewport_size: size(bounds.size.width, input_bounds.size.height),
         }
     }
 }
@@ -253,6 +271,7 @@ impl<M: InputModeKind> Element for EditorScrollbar<M> {
             Scrollbar::vertical(&scroll_handle)
         }
         .viewport_bounds(snapshot.layout.bounds)
+        .scroll_viewport_size(snapshot.layout.scroll_viewport_size)
         .scroll_size(snapshot.layout.scroll_size)
         .into_any_element();
 
@@ -281,17 +300,28 @@ impl<M: InputModeKind> Element for EditorScrollbar<M> {
     }
 }
 
-fn clamp_auto_grow_vertical_scroll_offset(
-    mode: &LayoutMode,
+// Prepaint and retained state must use the same range, including after content shrinks.
+pub(super) fn clamp_horizontal_scroll_offset(
+    offset: Pixels,
+    scroll_width: Pixels,
+    input_width: Pixels,
+    text_align: TextAlign,
+) -> Pixels {
+    let caret_clearance = if text_align == TextAlign::Left {
+        px(0.)
+    } else {
+        -CURSOR_WIDTH
+    };
+    let min_offset = (input_width - scroll_width + caret_clearance).min(caret_clearance);
+    offset.clamp(min_offset, px(0.))
+}
+
+fn clamp_vertical_scroll_offset(
     scroll_top: Pixels,
     scroll_height: Pixels,
     input_height: Pixels,
 ) -> Pixels {
-    if mode.is_auto_grow() {
-        scroll_top.clamp((input_height - scroll_height).min(px(0.)), px(0.))
-    } else {
-        scroll_top
-    }
+    scroll_top.clamp((input_height - scroll_height).min(px(0.)), px(0.))
 }
 
 /// Width the breakpoint strip claims at the left of the gutter: zero unless the state
@@ -453,6 +483,23 @@ impl<M: InputModeKind> TextElement<M> {
     }
 
     fn paint_mouse_listeners(&mut self, hitbox: &Hitbox, window: &mut Window, _: &mut App) {
+        // Text with room to scroll keeps the wheel from the scroll areas
+        // around it; its own listener scrolls it in the bubble phase.
+        window.on_mouse_event({
+            let state = self.state.clone();
+            let hitbox = hitbox.id;
+            move |event: &gpui::ScrollWheelEvent, phase, window, cx| {
+                if phase.capture()
+                    && hitbox.should_handle_scroll(window)
+                    && state
+                        .read(cx)
+                        .takes_scroll(event.delta.pixel_delta(window.line_height()))
+                {
+                    crate::scroll_bounce::claim_scroll(hitbox, cx);
+                }
+            }
+        });
+
         // Every touch is offered as a drag first; that is how a tap's mouse
         // events are later told apart from a mouse's.
         window.on_mouse_event(move |event: &TouchDragEvent, phase, _, cx| {
@@ -628,7 +675,7 @@ impl<M: InputModeKind> TextElement<M> {
                         bounds.size.width - line_number_width - safety_margin - cursor_pos.x
                     } else if scroll_offset.x + cursor_pos.x < px(0.) {
                         // cursor is out of left
-                        scroll_offset.x - cursor_pos.x
+                        -cursor_pos.x
                     } else {
                         scroll_offset.x
                     };
@@ -678,22 +725,9 @@ impl<M: InputModeKind> TextElement<M> {
                 }
             }
 
-            // Match the caret to the deferred scroll target (applied below) that
-            // the text paints at; otherwise the caret follows the cursor-scroll
-            // while the text uses the deferred offset, flashing it mid-field.
-            let cursor_scroll_x = state
-                .deferred_scroll_offset
-                .map(|offset| offset.x)
-                .unwrap_or(scroll_offset.x);
-
-            // For Right alignment, clamp cursor within the right edge of bounds so it
-            // stays visible without having to shift the text via scroll_offset.
-            let cursor_x = bounds.left() + cursor_pos.x + line_number_width + cursor_scroll_x;
-            let cursor_x = if last_layout.text_align == TextAlign::Right {
-                cursor_x.min(bounds.right() - CURSOR_WIDTH)
-            } else {
-                cursor_x
-            };
+            // Apply the final horizontal offset to every caret after cursor-follow and
+            // deferred scrolling have been resolved, regardless of selection order.
+            let cursor_x = bounds.left() + cursor_pos.x + line_number_width;
             cursor_infos.push(CursorRenderInfo {
                 bounds: Bounds::new(
                     point(
@@ -709,12 +743,21 @@ impl<M: InputModeKind> TextElement<M> {
         if let Some(deferred_scroll_offset) = state.deferred_scroll_offset {
             scroll_offset = deferred_scroll_offset;
         }
-        scroll_offset.y = clamp_auto_grow_vertical_scroll_offset(
-            &state.mode,
-            scroll_offset.y,
-            scroll_size.height,
-            bounds.size.height,
+        scroll_offset.x = clamp_horizontal_scroll_offset(
+            scroll_offset.x,
+            scroll_size.width,
+            bounds.size.width,
+            last_layout.text_align,
         );
+        for info in &mut cursor_infos {
+            info.bounds.origin.x += scroll_offset.x;
+            // Right-aligned text keeps the caret inside the viewport edge.
+            if last_layout.text_align == TextAlign::Right {
+                info.bounds.origin.x = info.bounds.origin.x.min(bounds.right() - CURSOR_WIDTH);
+            }
+        }
+        scroll_offset.y =
+            clamp_vertical_scroll_offset(scroll_offset.y, scroll_size.height, bounds.size.height);
 
         bounds.origin = bounds.origin + scroll_offset;
 
@@ -877,8 +920,17 @@ impl<M: InputModeKind> TextElement<M> {
         let ranges = state.search_session.matcher.matched_ranges();
         let current_match_ix = state.search_session.matcher.current_match_index();
 
-        let mut paths = Vec::with_capacity(ranges.as_ref().len());
-        for (index, range) in ranges.as_ref().iter().enumerate() {
+        // Matches are sorted and do not overlap, so only the ones that reach
+        // into the visible range need a layout.
+        let visible_range = &last_layout.visible_range_offset;
+        let first = ranges.partition_point(|range| range.end <= visible_range.start);
+        let mut paths = Vec::new();
+        for (index, range) in ranges
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take_while(|(_, range)| range.start < visible_range.end)
+        {
             if let Some(path) = Self::layout_match_range(range.clone(), last_layout, bounds) {
                 paths.push((path, current_match_ix == index));
             }
@@ -926,7 +978,7 @@ impl<M: InputModeKind> TextElement<M> {
         cx: &mut App,
     ) -> Vec<Path<Pixels>> {
         let state = self.state.read(cx);
-        if !state.focus_handle.is_focused(window) {
+        if !state.has_selection_focus(window, cx) {
             return vec![];
         }
 
@@ -1031,12 +1083,17 @@ impl<M: InputModeKind> TextElement<M> {
         } else {
             state.scroll_handle.offset().y
         };
-        scroll_top = clamp_auto_grow_vertical_scroll_offset(
-            &state.mode,
-            scroll_top,
-            line_height * total_lines,
-            input_height,
-        );
+        // Clamp as `layout_cursors` does, so we lay out the rows we paint.
+        // Ghost lines are left out: a tighter clamp only lays out extra rows
+        // above, and the last row stays in range.
+        let scroll_height = line_height * total_lines
+            + empty_bottom_height(
+                state.is_code_editor(),
+                state.scroll_beyond_last_line,
+                input_height,
+                line_height,
+            );
+        scroll_top = clamp_vertical_scroll_offset(scroll_top, scroll_height, input_height);
 
         // Display rows are uniformly `line_height` tall, so the visible window maps
         // directly to a display-row range.
@@ -1423,6 +1480,17 @@ impl<M: InputModeKind> TextElement<M> {
         cx: &mut App,
     ) {
         let is_hovered = fold_icon_layout.line_number_hitbox.is_hovered(window);
+        if !fold_icon_layout.icons.is_empty() {
+            // Mouse moves do not repaint the editor, so repaint when the pointer
+            // enters or leaves the gutter to show or hide the hover chevrons.
+            let hitbox = fold_icon_layout.line_number_hitbox.clone();
+            let entity_id = self.state.entity_id();
+            window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
+                if phase.bubble() && hitbox.is_hovered(window) != is_hovered {
+                    cx.notify(entity_id);
+                }
+            });
+        }
         for (display_row, is_folded, icon) in fold_icon_layout.icons.iter_mut() {
             let is_current_line = current_row == Some(*display_row);
 
@@ -1440,21 +1508,37 @@ impl<M: InputModeKind> TextElement<M> {
         window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
-        use gpui::{StatefulInteractiveElement as _, prelude::FluentBuilder as _};
+        use gpui::{
+            InteractiveElement as _, StatefulInteractiveElement as _, prelude::FluentBuilder as _,
+        };
         let presentation = self.state.read(cx).token_presentation.clone();
         let child = presentation.render(token, window, cx);
-        // A token is addressed by where it starts: the same reference may occur
-        // more than once, and the document revision guards a press against
-        // edits that move it.
+        // Preserve interaction state only for the same token occurrence and
+        // hover eligibility. Replacements and re-enabling start fresh.
         let start = token.range().start;
         let down_state = self.state.clone();
         let click_state = self.state.clone();
         let move_state = self.state.clone();
+        let hover_state = self.state.clone();
+        let hover_token = token.token().clone();
         let disabled = token.is_disabled();
+        let hover_enabled = presentation.has_hover_listener() && !disabled;
+        let id = gpui::ElementId::from(("inline-token", start));
+        let id = gpui::ElementId::from((id, token.token().id().clone()));
+        let id = gpui::ElementId::from((id, token.token().text().clone()));
+        let id = gpui::ElementId::from((id, token.token().label().clone()));
+        let id = gpui::ElementId::from((
+            id,
+            gpui::SharedString::from(if hover_enabled {
+                "hover-enabled"
+            } else {
+                "hover-disabled"
+            }),
+        ));
         let accessible = presentation.has_listener() && !disabled;
         let accessible_state = self.state.clone();
         gpui::div()
-            .id(("inline-token", start))
+            .id(id)
             .flex()
             .items_center()
             .h(token.line_height())
@@ -1563,6 +1647,28 @@ impl<M: InputModeKind> TextElement<M> {
                     listener(&event, window, cx);
                 }
             })
+            .on_hover(move |hovered, window, cx| {
+                // Hover never selects or edits; it only reports presence so the
+                // application can show a tooltip or run custom logic.
+                let hovered = *hovered;
+                let activation = hover_state.update(cx, |state, _| {
+                    // Anchor to the real laid-out token rect, not the
+                    // range-to-bounds guess: a token at a soft-wrap boundary
+                    // would otherwise report a zero/negative width or a
+                    // two-row height.
+                    let bounds = if hovered {
+                        state.token_bounds.get(&start).copied()?
+                    } else {
+                        // Exits use entry geometry even if an earlier callback
+                        // removed the token and its current bounds.
+                        Bounds::default()
+                    };
+                    state.token_hover(start, bounds, hovered, Some(&hover_token))
+                });
+                if let Some((listener, event)) = activation {
+                    listener(&event, window, cx);
+                }
+            })
             .child(child)
             .into_any_element()
     }
@@ -1574,7 +1680,7 @@ impl<M: InputModeKind> TextElement<M> {
         viewport: Pixels,
         window: &mut Window,
         cx: &mut App,
-    ) -> std::collections::HashMap<usize, AnyElement> {
+    ) -> std::collections::HashMap<usize, (AnyElement, Size<Pixels>)> {
         let style = window.text_style();
         let state = self.state.read(cx);
         let key = (
@@ -1586,11 +1692,31 @@ impl<M: InputModeKind> TextElement<M> {
         );
         if !state.tokens_visible() {
             if state.token_layout_cache.is_none() {
+                let mut exit = self.state.update(cx, |state, _| {
+                    state.token_bounds.clear();
+                    state.reconcile_token_hover()
+                });
+                while let Some((listener, event)) = exit {
+                    listener(&event, window, cx);
+                    exit = self
+                        .state
+                        .update(cx, |state, _| state.reconcile_token_hover());
+                }
                 return Default::default();
             }
             self.state.update(cx, |state, cx| {
                 state.display_map.set_inline_metrics(Rc::from([]), cx)
             });
+            let mut exit = self.state.update(cx, |state, _| {
+                state.token_bounds.clear();
+                state.reconcile_token_hover()
+            });
+            while let Some((listener, event)) = exit {
+                listener(&event, window, cx);
+                exit = self
+                    .state
+                    .update(cx, |state, _| state.reconcile_token_hover());
+            }
             return Default::default();
         }
         let revision = state.document_revision;
@@ -1637,7 +1763,7 @@ impl<M: InputModeKind> TextElement<M> {
                 cx,
             );
             measured.push((token.token().clone(), size.width.min(width).max(px(1.))));
-            elements.insert(token.range().start, element);
+            elements.insert(token.range().start, (element, size));
         }
         self.state.update(cx, |state, cx| {
             let mut cache = state.token_layout_cache.take().unwrap_or_default();
@@ -1839,12 +1965,22 @@ impl<M: InputModeKind> TextElement<M> {
         &self,
         layout: &LastLayout,
         bounds: Bounds<Pixels>,
-        mut measured: std::collections::HashMap<usize, AnyElement>,
+        mut measured: std::collections::HashMap<usize, (AnyElement, Size<Pixels>)>,
         window: &mut Window,
         cx: &mut App,
     ) -> Vec<AnyElement> {
         let state = self.state.read(cx);
         if !state.tokens_visible() {
+            let mut exit = self.state.update(cx, |state, _| {
+                state.token_bounds.clear();
+                state.reconcile_token_hover()
+            });
+            while let Some((listener, event)) = exit {
+                listener(&event, window, cx);
+                exit = self
+                    .state
+                    .update(cx, |state, _| state.reconcile_token_hover());
+            }
             return vec![];
         }
         let width = state
@@ -1871,12 +2007,14 @@ impl<M: InputModeKind> TextElement<M> {
             }
             y += layout.lines[ix].size(layout.line_height).height;
         }
-        placements
-            .into_iter()
-            .map(|(token, origin)| {
-                let mut element = measured.remove(&token.range().start).unwrap_or_else(|| {
+        let mut out = Vec::new();
+        let mut token_bounds = std::collections::HashMap::new();
+        for (token, origin) in placements {
+            let (mut element, element_size) = match measured.remove(&token.range().start) {
+                Some(found) => found,
+                None => {
                     let mut element = self.token_element(&token, window, cx);
-                    element.layout_as_root(
+                    let element_size = element.layout_as_root(
                         size(
                             gpui::AvailableSpace::MaxContent,
                             gpui::AvailableSpace::Definite(layout.line_height),
@@ -1884,12 +2022,24 @@ impl<M: InputModeKind> TextElement<M> {
                         window,
                         cx,
                     );
-                    element
-                });
-                element.prepaint_at(origin, window, cx);
-                element
-            })
-            .collect()
+                    (element, element_size)
+                }
+            };
+            element.prepaint_at(origin, window, cx);
+            token_bounds.insert(token.range().start, Bounds::new(origin, element_size));
+            out.push(element);
+        }
+        let mut exit = self.state.update(cx, |state, _| {
+            state.token_bounds = token_bounds;
+            state.reconcile_token_hover()
+        });
+        while let Some((listener, event)) = exit {
+            listener(&event, window, cx);
+            exit = self
+                .state
+                .update(cx, |state, _| state.reconcile_token_hover());
+        }
+        out
     }
 
     /// Prepaint one clickable dot per visible line at the left of the gutter, coloured
@@ -2329,6 +2479,17 @@ impl PrepaintState {
     }
 }
 
+/// Align a caret to whole device pixels.
+///
+/// Text positions are fractional, and a one-pixel caret at a fractional x is
+/// spread over two device pixels by antialiasing, which draws it faint and
+/// thin. Rounding its edges to the device grid keeps every caret crisp.
+fn snap_caret_to_device_pixels(bounds: Bounds<Pixels>, scale_factor: f32) -> Bounds<Pixels> {
+    let x = (bounds.origin.x * scale_factor).round() / scale_factor;
+    let width = (bounds.size.width * scale_factor).round().max(px(1.)) / scale_factor;
+    Bounds::new(point(x, bounds.origin.y), size(width, bounds.size.height))
+}
+
 impl<M: InputModeKind> IntoElement for TextElement<M> {
     type Element = Self;
 
@@ -2493,13 +2654,10 @@ impl<M: InputModeKind> Element for TextElement<M> {
         if state.is_multi_line() {
             style.flex_grow = 1.0;
             style.size.height = relative(1.).into();
-            if state.mode.is_auto_grow() {
-                // Auto grow to let height match to rows, but not exceed max rows.
-                let rows = state.mode.max_rows().min(state.mode.rows());
-                style.min_size.height = (rows * line_height).into();
-            } else {
-                style.min_size.height = line_height.into();
-            }
+            // At least `rows` tall (auto grow: the content's rows, capped at
+            // `max_rows`); a taller parent still fills it.
+            let rows = state.mode.max_rows().min(state.mode.rows());
+            style.min_size.height = (rows * line_height).into();
         } else {
             // For single-line inputs, the minimum height should be the line height
             style.size.height = line_height.into();
@@ -2527,9 +2685,18 @@ impl<M: InputModeKind> Element for TextElement<M> {
             window.text_system().layout_width(font_id, text_size, ' ')
         };
 
-        self.state.update(cx, |state, cx| {
+        // Text stretched past an end is drawn that far from where it scrolled
+        // to, inside the frame that clips it, and springs back over the next
+        // frames. Scrolling and everything measured from it stay exact.
+        let mut stretch = self.state.update(cx, |state, cx| {
             state.display_map.set_font(font, text_size, cx);
             state.display_map.ensure_text_prepared(&state.text, cx);
+            if cx.reduce_motion() {
+                state.overscroll.reset();
+            } else if state.overscroll.step(cx.background_executor().now()) {
+                window.request_animation_frame();
+            }
+            state.overscroll.offset()
         });
 
         let state = self.state.read(cx);
@@ -2730,23 +2897,44 @@ impl<M: InputModeKind> Element for TextElement<M> {
         // 2. Multi-line with soft wrap disabled.
         if state.is_single_line() || !state.soft_wrap {
             let longest_row = state.display_map.longest_row();
-            let longest_line: SharedString = state.text.slice_line(longest_row).to_string().into();
-            longest_line_width = window
-                .text_system()
-                .shape_line(
-                    longest_line.clone(),
-                    text_size,
-                    &[TextRun {
-                        len: longest_line.len(),
-                        font: style.font(),
-                        color: gpui::black(),
-                        background_color: None,
-                        underline: None,
-                        strikethrough: None,
-                    }],
-                    wrap_width,
-                )
-                .width;
+            let longest_line = state.text.slice_line(longest_row);
+            let key = LongestLineKey {
+                document_revision: state.document_revision,
+                row: longest_row,
+                len: longest_line.len(),
+                font: style.font(),
+                text_size,
+                wrap_width,
+            };
+            let cached = state
+                .longest_line_width
+                .take()
+                .filter(|(cached_key, _)| *cached_key == key);
+            longest_line_width = match cached {
+                Some((_, width)) => width,
+                None => {
+                    let longest_line: SharedString = longest_line.to_string().into();
+                    window
+                        .text_system()
+                        .shape_line(
+                            longest_line.clone(),
+                            text_size,
+                            &[TextRun {
+                                len: longest_line.len(),
+                                font: key.font.clone(),
+                                color: gpui::black(),
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            }],
+                            wrap_width,
+                        )
+                        .width
+                }
+            };
+            state
+                .longest_line_width
+                .set(Some((key, longest_line_width)));
         }
         if state.tokens_visible() {
             longest_line_width = if let Some(width) = wrap_width {
@@ -2834,6 +3022,16 @@ impl<M: InputModeKind> Element for TextElement<M> {
         // regardless of horizontal scroll position.
         let input_bounds = bounds;
         let original_x = bounds.origin.x;
+        // Resolved content and viewport sizes can change during a gesture.
+        // A non-scrolling input must not retain a drag that will no longer
+        // receive its Ended packet through the overscroll path.
+        if scroll_size.height <= input_bounds.size.height {
+            self.state.update(cx, |state, _| state.overscroll.reset());
+            stretch = 0.;
+        }
+        // Keep viewport geometry for scrollbars and hitboxes fixed; only
+        // text, its carets, selections, and gutter contents are displaced.
+        bounds.origin.y += px(stretch);
 
         let (cursor_infos, cursor_scroll_offset, current_row) =
             self.layout_cursors(&last_layout, &mut bounds, scroll_size, window, cx);
@@ -2842,6 +3040,34 @@ impl<M: InputModeKind> Element for TextElement<M> {
             .iter()
             .find(|info| info.is_active)
             .map(|info| info.bounds);
+
+        // Stash the fresh caret geometry for caret-anchored popups. Their
+        // deferred prepaint runs after this prepaint but before paint, so
+        // they anchor to the current frame's caret instead of the previous
+        // frame's. Only the positioning geometry is stashed here; the rest
+        // of the paint-time state updates stay where they are.
+        let caret_geometry = last_layout.cursor_bounds.map(|cursor_bounds| {
+            let mut scroll_offset = cursor_scroll_offset;
+            // Mirror update_scroll_offset's clamping with the fresh values,
+            // so the stash matches what paint will publish.
+            let state = self.state.read(cx);
+            let safe_y_range = (-scroll_size.height + input_bounds.size.height).min(px(0.))..px(0.);
+            scroll_offset.y = if state.is_single_line() {
+                px(0.)
+            } else {
+                scroll_offset.y.clamp(safe_y_range.start, safe_y_range.end)
+            };
+            scroll_offset.x = clamp_horizontal_scroll_offset(
+                scroll_offset.x,
+                scroll_size.width,
+                input_bounds.size.width,
+                last_layout.text_align,
+            );
+            PrepaintCaretGeometry::new(cursor_bounds, line_height, input_bounds, scroll_offset)
+        });
+        self.state.update(cx, |state, _| {
+            state.prepaint_caret_geometry = caret_geometry;
+        });
 
         let search_match_paths = self.layout_search_matches(&last_layout, &mut bounds, cx);
         let selection_paths = self.layout_selections(&last_layout, &mut bounds, window, cx);
@@ -3189,7 +3415,10 @@ impl<M: InputModeKind> Element for TextElement<M> {
         // Paint blinking cursors (shared blink state for all carets)
         if focused && show_cursor {
             for cursor_info in prepaint.cursor_infos_with_scroll() {
-                window.paint_quad(fill(cursor_info.bounds, editor_style.caret));
+                window.paint_quad(fill(
+                    snap_caret_to_device_pixels(cursor_info.bounds, window.scale_factor()),
+                    editor_style.caret,
+                ));
             }
         }
 
@@ -3604,6 +3833,380 @@ mod tests {
             DecorationHarness(state)
         });
         (editor.unwrap(), window)
+    }
+
+    struct TextareaHarness(Entity<crate::input::TextareaState>);
+
+    #[gpui::test]
+    fn scroll_bounce_keeps_the_scrollbar_viewport_fixed(cx: &mut TestAppContext) {
+        let text = (0..60)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (editor, window) = decoration_editor(cx, &text, false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            let viewport = editor
+                .read(cx)
+                .editor_scrollbar_snapshot
+                .get()
+                .unwrap()
+                .layout
+                .bounds;
+            let text_origin = editor.read(cx).last_bounds.unwrap().origin;
+            editor.update(cx, |state, cx| {
+                state.set_scroll_bounce(true, cx);
+                state.on_scroll_wheel(
+                    &gpui::ScrollWheelEvent {
+                        delta: gpui::ScrollDelta::Pixels(point(px(0.), px(60.))),
+                        touch_phase: gpui::TouchPhase::Started,
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                );
+            });
+            window.draw(cx).clear(cx);
+            let state = editor.read(cx);
+            let stretch = state.overscroll.offset();
+            assert!(stretch > 0.);
+            assert_eq!(
+                state.editor_scrollbar_snapshot.get().unwrap().layout.bounds,
+                viewport
+            );
+            assert_eq!(
+                state.last_bounds.unwrap().origin.y,
+                text_origin.y + px(stretch)
+            );
+        });
+    }
+
+    impl Render for TextareaHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(self.0.clone())
+        }
+    }
+
+    /// A textarea 100 px down a taller bouncing scroll area.
+    struct NestedTextarea(Entity<crate::input::TextareaState>, gpui::ScrollHandle);
+    use gpui::StatefulInteractiveElement as _;
+
+    impl Render for NestedTextarea {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            crate::ScrollBounce::new(
+                "outer",
+                &self.1,
+                div()
+                    .id("outer-viewport")
+                    .w(px(240.))
+                    .h(px(300.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.1)
+                    .child(div().h(px(100.)))
+                    .child(div().h(px(120.)).child(self.0.clone()))
+                    .child(div().h(px(600.))),
+            )
+            .enabled(true)
+        }
+    }
+
+    #[gpui::test]
+    fn a_textarea_keeps_its_scroll_from_the_area_around_it(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let text = (1..=40)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let outer = gpui::ScrollHandle::new();
+        let mut textarea = None;
+        let window = cx.open_window(size(px(240.), px(400.)), |window, cx| {
+            let state =
+                cx.new(|cx| crate::input::TextareaState::new(window, cx).default_value(text));
+            textarea = Some(state.clone());
+            NestedTextarea(state, outer.clone())
+        });
+        let textarea = textarea.unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let swipe = |cx: &mut VisualTestContext, y: f32| {
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: point(px(100.), px(y)),
+                delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-40.))),
+                touch_phase: gpui::TouchPhase::Moved,
+                ..Default::default()
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        };
+        swipe(&mut cx, 160.);
+        let scrolled = cx.update(|_, cx| textarea.read(cx).scroll_handle.offset().y);
+        assert!(scrolled < px(0.), "the textarea scrolls");
+        assert_eq!(outer.offset().y, px(0.), "the area around it does not");
+        swipe(&mut cx, 40.);
+        assert_eq!(outer.offset().y, px(-40.), "outside the textarea it does");
+    }
+
+    #[gpui::test]
+    fn set_scroll_offset_past_the_end_is_clamped(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let text = (1..=40)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut textarea = None;
+        let window = cx.open_window(size(px(240.), px(400.)), |window, cx| {
+            let state =
+                cx.new(|cx| crate::input::TextareaState::new(window, cx).default_value(text));
+            textarea = Some(state.clone());
+            TextareaHarness(state)
+        });
+        let textarea = textarea.unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            textarea.update(cx, |state, cx| {
+                state.set_scroll_offset(point(px(0.), px(-10_000.)), cx)
+            });
+            window.draw(cx).clear(cx);
+
+            let state = textarea.read(cx);
+            let painted = state
+                .editor_scrollbar_snapshot
+                .get()
+                .unwrap()
+                .cursor_scroll_offset;
+            let furthest = (state.input_bounds.size.height - state.scroll_size.height).min(px(0.));
+            assert!(furthest < px(0.));
+            assert_eq!(painted.y, furthest);
+
+            let layout = state.last_layout.as_ref().unwrap();
+            let rows = viewport_visible_lines(state.input_bounds.size.height, layout.line_height);
+            assert!(layout.visible_range.len() >= rows);
+        });
+    }
+
+    #[gpui::test]
+    fn set_scroll_offset_past_the_end_is_clamped_in_a_code_editor(cx: &mut TestAppContext) {
+        let text = (1..=40)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (editor, window) = decoration_editor(cx, &text, false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            editor.update(cx, |state, cx| {
+                state.set_scroll_offset(point(px(0.), px(-10_000.)), cx)
+            });
+            window.draw(cx).clear(cx);
+
+            let state = editor.read(cx);
+            let painted = state
+                .editor_scrollbar_snapshot
+                .get()
+                .unwrap()
+                .cursor_scroll_offset;
+            // The furthest offset includes the room below the last line.
+            let furthest = state.input_bounds.size.height - state.scroll_size.height;
+            assert!(-furthest > state.input_bounds.size.height);
+            assert_eq!(painted.y, furthest);
+        });
+    }
+
+    #[gpui::test]
+    fn selection_paths_follow_the_input_and_its_menu_focus(cx: &mut TestAppContext) {
+        let (editor, window) = decoration_editor(cx, "alpha beta", false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            let menu_focus = cx.focus_handle();
+            let other_focus = cx.focus_handle();
+            editor.update(cx, |state, cx| {
+                state.set_selected_range(0..5, cx);
+                state.focus(window, cx);
+            });
+
+            let selection_paths = |window: &mut Window, cx: &mut App| {
+                window.draw(cx).clear(cx);
+                let state = editor.read(cx);
+                let layout = state.last_layout.clone().unwrap();
+                let mut bounds = state.input_bounds;
+                TextElement::new(editor.clone()).layout_selections(&layout, &mut bounds, window, cx)
+            };
+            let focused_paths = selection_paths(window, cx).len();
+            assert!(focused_paths > 0);
+
+            editor.update(cx, |state, cx| {
+                state.set_selection_focus(Some(menu_focus.clone()), cx);
+            });
+            menu_focus.focus(window, cx);
+            assert!(!editor.read(cx).focus_handle.is_focused(window));
+            assert_eq!(selection_paths(window, cx).len(), focused_paths);
+            // The opening frame can still use the input's old focus. Check
+            // another frame with the menu already focused as well.
+            assert_eq!(selection_paths(window, cx).len(), focused_paths);
+
+            other_focus.focus(window, cx);
+            assert!(selection_paths(window, cx).is_empty());
+            assert_eq!(editor.read(cx).selected_range(), 0..5);
+
+            menu_focus.focus(window, cx);
+            editor.update(cx, |state, cx| state.set_selection_focus(None, cx));
+            assert!(selection_paths(window, cx).is_empty());
+            editor.update(cx, |state, cx| state.focus(window, cx));
+            assert_eq!(selection_paths(window, cx).len(), focused_paths);
+
+            // Retaining the input must not keep a removed menu alive.
+            let weak_menu = menu_focus.downgrade();
+            editor.update(cx, |state, cx| {
+                state.set_selection_focus(Some(menu_focus.clone()), cx);
+            });
+            menu_focus.focus(window, cx);
+            drop(menu_focus);
+            assert!(weak_menu.upgrade().is_none());
+            assert!(selection_paths(window, cx).is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn horizontal_scroll_is_clamped_before_text_and_caret_layout(cx: &mut TestAppContext) {
+        let (editor, window) = decoration_editor(cx, "short text", false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            let state = editor.read(cx);
+            let layout = state.last_layout.clone().unwrap();
+            let input_bounds = state.input_bounds;
+            let scroll_size = input_bounds.size;
+            let element = TextElement::new(editor.clone());
+            let mut bounds = input_bounds;
+            let (baseline, _, _) =
+                element.layout_cursors(&layout, &mut bounds, scroll_size, window, cx);
+
+            // Both a stale offset after deletion and a deferred scroll target must
+            // be limited before either text or carets are positioned this frame.
+            for deferred in [None, Some(point(px(-80.), px(0.)))] {
+                editor.update(cx, |state, _| {
+                    state.scroll_handle.set_offset(point(px(-40.), px(0.)));
+                    state.deferred_scroll_offset = deferred;
+                });
+                let mut bounds = input_bounds;
+                let (carets, offset, _) =
+                    element.layout_cursors(&layout, &mut bounds, scroll_size, window, cx);
+                assert_eq!(offset.x, px(0.));
+                assert_eq!(bounds.origin.x, input_bounds.origin.x);
+                assert_eq!(carets.len(), baseline.len());
+                for (caret, original) in carets.iter().zip(&baseline) {
+                    assert_eq!(caret.bounds.origin.x, original.bounds.origin.x);
+                }
+                editor.update(cx, |state, cx| {
+                    state.scroll_size = scroll_size;
+                    state.update_scroll_offset(Some(offset), cx);
+                    assert_eq!(state.scroll_handle.offset().x, offset.x);
+                });
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn aligned_horizontal_scroll_clamps_deferred_targets(cx: &mut TestAppContext) {
+        let (editor, window) = decoration_editor(cx, &"wide text ".repeat(80), false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            let mut layout = editor.read(cx).last_layout.clone().unwrap();
+            let input_bounds = editor.read(cx).input_bounds;
+            let element = TextElement::new(editor.clone());
+
+            for alignment in [TextAlign::Left, TextAlign::Right, TextAlign::Center] {
+                layout.text_align = alignment;
+                for overflow in [px(0.), px(120.)] {
+                    let scroll_size =
+                        size(input_bounds.size.width + overflow, input_bounds.size.height);
+                    let minimum = if alignment == TextAlign::Left {
+                        -overflow
+                    } else {
+                        -overflow - CURSOR_WIDTH
+                    };
+                    editor.update(cx, |state, _| {
+                        state.text_align = alignment;
+                        state.last_selected_range = Some(*state.active_selection());
+                        state.deferred_scroll_offset = Some(point(minimum, px(0.)));
+                    });
+                    let mut bounds = input_bounds;
+                    let (expected, _, _) =
+                        element.layout_cursors(&layout, &mut bounds, scroll_size, window, cx);
+
+                    for target in [minimum - px(100.), px(100.)] {
+                        editor.update(cx, |state, _| {
+                            state.deferred_scroll_offset = Some(point(target, px(0.)));
+                        });
+                        let mut bounds = input_bounds;
+                        let (carets, offset, _) =
+                            element.layout_cursors(&layout, &mut bounds, scroll_size, window, cx);
+                        let expected_offset = if target < minimum { minimum } else { px(0.) };
+                        assert_eq!(offset.x, expected_offset);
+                        assert_eq!(bounds.left(), input_bounds.left() + expected_offset);
+                        if target < minimum {
+                            assert_eq!(carets[0].bounds, expected[0].bounds);
+                        }
+                        if alignment == TextAlign::Right {
+                            assert!(carets[0].bounds.right() <= input_bounds.right());
+                        }
+                        editor.update(cx, |state, cx| {
+                            state.scroll_size = scroll_size;
+                            state.update_scroll_offset(Some(offset), cx);
+                            assert_eq!(state.scroll_handle.offset().x, expected_offset);
+                        });
+                    }
+                }
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn deferred_horizontal_scroll_moves_every_caret(cx: &mut TestAppContext) {
+        use super::super::{cursor::CursorSelection, selection::CursorId};
+
+        let (editor, window) = decoration_editor(cx, &"wide text ".repeat(80), false);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            let layout = editor.read(cx).last_layout.clone().unwrap();
+            let input_bounds = editor.read(cx).input_bounds;
+            let scroll_size = size(input_bounds.size.width + px(120.), input_bounds.size.height);
+            let element = TextElement::new(editor.clone());
+
+            for offsets in [[0, 2, 4], [0, 4, 2], [4, 0, 2]] {
+                editor.update(cx, |state, _| {
+                    state.selections.replace_all(
+                        offsets
+                            .into_iter()
+                            .enumerate()
+                            .map(|(id, offset)| {
+                                CursorSelection::new(CursorId::new(id), offset, offset)
+                            })
+                            .collect(),
+                    );
+                    state.last_selected_range = Some(*state.active_selection());
+                    state.scroll_handle.set_offset(point(px(0.), px(0.)));
+                    state.deferred_scroll_offset = None;
+                });
+                let mut bounds = input_bounds;
+                let (baseline, _, _) =
+                    element.layout_cursors(&layout, &mut bounds, scroll_size, window, cx);
+                editor.update(cx, |state, _| {
+                    state.deferred_scroll_offset = Some(point(px(-60.), px(0.)));
+                });
+                let mut bounds = input_bounds;
+                let (carets, offset, _) =
+                    element.layout_cursors(&layout, &mut bounds, scroll_size, window, cx);
+                assert_eq!(offset.x, px(-60.));
+                assert_eq!(carets.len(), 3);
+                for (caret, original) in carets.iter().zip(baseline) {
+                    assert_eq!(caret.bounds.left(), original.bounds.left() - px(60.));
+                }
+            }
+        });
     }
 
     #[gpui::test]
@@ -4095,6 +4698,7 @@ mod tests {
             Bounds::new(point(px(51.), px(18.)), size(px(262.), px(87.)))
         );
         assert_eq!(layout.scroll_size, size(px(972.), px(200.)));
+        assert_eq!(layout.scroll_viewport_size, size(px(262.), px(80.)));
 
         let layout_without_gutter =
             EditorScrollbarLayout::new(input_bounds, px(0.), size(px(500.), px(120.)), paddings);
@@ -4104,6 +4708,10 @@ mod tests {
             Bounds::new(point(px(10.), px(18.)), size(px(303.), px(87.)))
         );
         assert_eq!(layout_without_gutter.scroll_size, size(px(513.), px(120.)));
+        assert_eq!(
+            layout_without_gutter.scroll_viewport_size,
+            size(px(303.), px(80.))
+        );
     }
 
     #[test]
@@ -4127,26 +4735,22 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_grow_scroll_offset_is_clamped_to_current_viewport() {
-        let mode = LayoutMode::auto_grow(3, 8);
-
+    fn test_vertical_scroll_offset_is_clamped_to_current_viewport() {
         assert_eq!(
-            clamp_auto_grow_vertical_scroll_offset(&mode, px(-260.), px(340.), px(160.)),
+            clamp_vertical_scroll_offset(px(-260.), px(340.), px(160.)),
             px(-180.)
         );
         assert_eq!(
-            clamp_auto_grow_vertical_scroll_offset(&mode, px(-40.), px(340.), px(160.)),
+            clamp_vertical_scroll_offset(px(-40.), px(340.), px(160.)),
             px(-40.)
         );
         assert_eq!(
-            clamp_auto_grow_vertical_scroll_offset(&mode, px(20.), px(340.), px(160.)),
+            clamp_vertical_scroll_offset(px(20.), px(340.), px(160.)),
             px(0.)
         );
-
-        let plain_text = LayoutMode::plain_text();
         assert_eq!(
-            clamp_auto_grow_vertical_scroll_offset(&plain_text, px(-260.), px(340.), px(160.)),
-            px(-260.)
+            clamp_vertical_scroll_offset(px(-40.), px(100.), px(160.)),
+            px(0.)
         );
     }
 
